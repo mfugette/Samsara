@@ -1,0 +1,11 @@
+{
+  "type": "samsara:deva",
+  "generator": {
+    "type": "minecraft:noise",
+    "settings": "samsara:deva",
+    "biome_source": {
+      "type": "minecraft:fixed",
+      "biome": "samsara:deva"
+    }
+  }
+}

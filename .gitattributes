@@ -1,0 +1,10 @@
+# Keep line endings byte-identical to what KubeJS reads at runtime.
+#
+# Git's autocrlf would rewrite these on checkout. In a project whose dominant
+# failure mode is "the script loaded with 0 errors and silently did nothing",
+# a checkout that changes the bytes KubeJS parses is a variable nobody needs.
+# Normalise to LF in the repo and check out LF, on every platform.
+* text=auto eol=lf
+
+# Binary: never touch.
+*.png binary

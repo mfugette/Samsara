@@ -1,0 +1,11 @@
+{
+  "type": "samsara:naraka",
+  "generator": {
+    "type": "minecraft:noise",
+    "settings": "samsara:naraka",
+    "biome_source": {
+      "type": "minecraft:fixed",
+      "biome": "samsara:naraka"
+    }
+  }
+}

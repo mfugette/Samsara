@@ -1,0 +1,88 @@
+# Samsara -- a Minecraft instance that happens to contain a project.
+#
+# WHY DENY-ALL-THEN-WHITELIST, rather than the usual list of exclusions:
+# this repo's root is a live CurseForge *instance* directory, not a mod source
+# tree. The game and the launcher continuously write files here that we do not
+# own (saves, logs, caches, generated configs, downloaded jars), and new ones
+# appear whenever a mod is added. A deny-list would silently start tracking
+# whatever the next mod or launcher update drops in. Whitelisting means the
+# repo contains the project and nothing else, by default.
+#
+# NOTE most published Minecraft .gitignore advice -- including KubeJS's own --
+# targets MOD DEVELOPMENT (Gradle: build/, .gradle/, run/, Eclipse/IDEA files).
+# None of that applies here: there is no build. The source IS the scripts and
+# the datapack JSON, interpreted at runtime.
+
+# 1. Ignore everything.
+/*
+/.*
+
+# 2. Un-ignore the project.
+
+# The repo's own metadata.
+!/.gitignore
+!/.gitattributes
+
+# KubeJS: all of our actual source. Scripts (server/client/startup) plus the
+# datapack JSON that defines the five custom realms -- dimension,
+# dimension_type, worldgen/biome, worldgen/noise_settings.
+!/kubejs/
+
+# Project documentation and the agent brief. The project notes are the operational
+# brief; the notes folder holds the design docs, the session handoff, and the offline
+# test harness (test_routing.js), all of which are source.
+
+# 3. Re-ignore things that live INSIDE the whitelisted trees.
+
+# KubeJS writes its Mojang-mapping remapper cache and generated output here.
+# Machine-specific, large, and regenerated on demand.
+/kubejs/cache/
+/kubejs/exported/
+
+# Agent scratch state: per-session transcripts, local settings, tool caches.
+# settings.local.json is explicitly the "not shared" settings file.
+
+# OS metadata, anywhere in the tree.
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Deliberately NOT tracked, and why. Each is already covered by the /* above;
+# this is the reasoning, so nobody "helpfully" adds them later.
+#
+#   saves/                 71 MB of binary world data, and the biggest reason
+#                          not to track it: the project notes' hard rule is that save
+#                          files are never deleted or corrupted. Git operations
+#                          (checkout, reset, stash) on a live world directory
+#                          are exactly how that happens. Keep git away from it.
+#   mods/                  Third-party jars. Versions are pinned in the project notes
+#                          and reproducible from minecraftinstance.json; binary
+#                          blobs in git are not how you distribute them. Also
+#                          the project notes require asking before changing mods, and
+#                          tracking them invites silent changes.
+#   config/                Game-GENERATED per-mod tomls, rewritten on launch
+#                          (it currently holds leftovers for Aether, Twilight
+#                          Forest and Undergarden -- mods that are not even
+#                          installed). Not source. If a config ever becomes
+#                          load-bearing for the pack, it belongs in
+#                          defaultconfigs/ and should be whitelisted then.
+#   logs/, crash-reports/  Runtime output. Read constantly during testing --
+#                          the project notes require checking logs/latest.log after
+#                          every in-game test -- but never a source artifact.
+#   local/                 KubeJS dev.properties: machine-local toggles.
+#   rhino.local.properties Carries its own warning in the file: "please do not
+#                          push this to version control".
+#   minecraftinstance.json Launcher state: ~MBs of embedded Forge version JSON
+#                          and per-file CDN URLs, rewritten by CurseForge.
+#   .curseclient           Launcher instance UUID.
+#   usercache.json         Contain a real player UUID and username. Not secret,
+#   usernamecache.json     but personal data with no reason to be in history.
+#   options.txt, imgui.ini Local client settings (keybinds, video, UI layout).
+#   downloads/             Launcher download cache.
+#   resourcepacks/         Empty, and client-side preference either way.
+#   shaderpacks/
+#   datapacks/             Empty: Samsara ships its datapack through
+#                          kubejs/data/, which IS tracked.
+#   defaultconfigs/        Empty today. Whitelist it if the pack ever ships
+#                          default mod configs -- those WOULD be source.
