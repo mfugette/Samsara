@@ -86,3 +86,8 @@ desktop.ini
 #                          kubejs/data/, which IS tracked.
 #   defaultconfigs/        Empty today. Whitelist it if the pack ever ships
 #                          default mod configs -- those WOULD be source.
+
+# Python bytecode, e.g. from importing mutate.py. Must come AFTER
+# the whitelist above, or the notes folder's rule would re-include it.
+__pycache__/
+*.pyc
