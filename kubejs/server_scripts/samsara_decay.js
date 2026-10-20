@@ -1,21 +1,22 @@
-// Samsara — karma decay and ripening.
+// Samsara — karma ripening, and the shared tick clock.
 //
-// Karma is not a permanent ledger. In Buddhist thought a birth ends when the karma
-// that produced it is exhausted, so karma must wear away. Two things wear it down:
+// (The filename is historical: this file once held passive decay too.)
 //
-//   1. TIME (passive decay). Every stat loses a fraction of itself on a slow timer.
-//      Proportional rather than flat, so a large debt sheds fast at first and then
-//      slows, while small amounts linger instead of snapping to zero.
-//   2. REBIRTH (ripening). The karma that CAUSED a birth is spent when that birth
-//      ends. This is realm-specific: a deva's merit burns away, a hell-being's
-//      hatred does.
+// Karma is spent in exactly one way: REBIRTH (ripening). The karma that CAUSED a
+// birth is spent when that birth ends. This is realm-specific: a deva's merit burns
+// away, a hell-being's hatred does.
+//
+// THERE IS NO PASSIVE DECAY, deliberately -- see the note where config.decay used
+// to be. Dhp 71: an evil deed "does not immediately bear fruit, like milk that does
+// not turn sour all at once; but smoldering, it follows the fool like fire covered
+// by ashes." Between births, bad karma is diluted by antidotes (routing works on
+// shares -- AN 3.99's salt crystal), not worn away by the clock.
 //
 // RIPENING REPLACES THE OLD FLAT DEATH BURN. The burn took 25% of all six stats
 // equally and ran before the destination was known, so it could not be
 // realm-specific. Ripening must know the realm, so it runs AFTER pickDestination.
 //
-// Wisdom is the exception to both: it ripens at config.ripening.wisdomRate in every
-// realm and decays passively at a fraction of the normal rate. Insight carries over
+// Wisdom ripens at config.ripening.wisdomRate in every realm. Insight carries over
 // between lives -- the soft form of the canonical rule that stream-entry
 // permanently closes off the lower realms.
 
@@ -25,14 +26,18 @@ global.SMS = global.SMS || {}
 
 // Multiply a set of stats by `keep` (a 0..1 retention factor).
 //
-// `keys` defaults to all six. Values at or below config.decay.floor are zeroed so
-// stats actually reach 0 rather than trailing infinitesimals forever.
+// `keys` defaults to all six. Values at or below config.ripening.floor are zeroed
+// so stats actually reach 0 rather than trailing infinitesimals forever.
 //
 // Every write goes through global.SMS.setStat, which clamps to [0, statCap] and
 // quantises to config.statGrain -- so multiplying can never leave a trailing
 // decimal behind. Returns the total amount removed, for logging.
+//
+// NOTE: a reduction under half a grain (0.025) rounds back to the old value, so a
+// small rate on a small stat is a no-op. That is what silently killed passive
+// decay. Ripening's rates (>= 10%) only stall below 0.25, which is acceptable.
 global.SMS.scaleStats = (player, keep, keys) => {
-    const cfg = global.SMS.config.decay
+    const cfg = global.SMS.config.ripening
     const stats = keys || global.SMS.STATS
     var removed = 0
 
@@ -53,11 +58,7 @@ global.SMS.scaleStats = (player, keep, keys) => {
 // Back-compat alias: the old name scaled all six unconditionally.
 global.SMS.scaleAllStats = (player, keep) => global.SMS.scaleStats(player, keep, null)
 
-// ---- Passive decay ---------------------------------------------------------
-
-// Throttle: ServerEvents.tick fires 20x/second, and we only want to touch player
-// NBT every config.decay.intervalTicks.
-let decayCounter = 0
+// ---- The tick clock --------------------------------------------------------
 
 // A pure-JS tick clock.
 //
@@ -77,43 +78,11 @@ let decayCounter = 0
 // `global` survives /reload in KubeJS, so keep an existing value when there is one.
 global.SMS.tickClock = global.SMS.tickClock || 0
 
+// UNCONDITIONAL. This used to sit behind `if (!config.decay.enabled) return`, so
+// turning decay off would have stopped the clock -- and with it every cooldown,
+// anti-farm window and the endurance encounters, all silently.
 ServerEvents.tick(event => {
-    const cfg = global.SMS.config.decay
-    if (!cfg.enabled) return
-
     global.SMS.tickClock++
-
-    decayCounter++
-    if (decayCounter < cfg.intervalTicks) return
-    decayCounter = 0
-
-    const players = event.server.players
-    if (!players || players.size() === 0) return
-
-    // Wisdom decays far more slowly than the other five. Splitting the call in two
-    // is simpler than threading a per-stat rate through scaleStats, and it keeps
-    // the "all six decay together" intent visible.
-    const normalKeep = 1 - cfg.fraction
-    const wisdomKeep = 1 - cfg.fraction * cfg.wisdomFactionMultiplier
-
-    const notWisdom = global.SMS.STATS.filter(s => s !== 'wisdom')
-
-    for (let i = 0; i < players.size(); i++) {
-        var player = players.get(i)
-
-        // A liberated player is outside the karma system entirely -- no decay, no
-        // ripening, no routing. See the project notes' liberation section.
-        if (global.SMS.isLiberated(player)) continue
-
-        var removed = global.SMS.scaleStats(player, normalKeep, notWisdom)
-        removed += global.SMS.scaleStats(player, wisdomKeep, ['wisdom'])
-
-        if (removed > 0) {
-            // No .toFixed(): java.lang.Double has no such method under Rhino, and
-            // calling it throws at the END of an otherwise successful handler.
-            console.info(`[Samsara] decay: ${player.profile.name} shed ${Math.round(removed * 100) / 100} karma`)
-        }
-    }
 })
 
 // ---- Ripening --------------------------------------------------------------
@@ -220,4 +189,4 @@ global.SMS.burnKarmaOnDeath = player => {
     )
 }
 
-console.info('[Samsara] decay and ripening hooks registered')
+console.info('[Samsara] ripening and tick clock registered (no passive decay)')

@@ -30,8 +30,8 @@ const statKey = stat => global.SMS.config.nbt.statPrefix + stat
 // Round to a multiple of config.statGrain.
 //
 // THE SINGLE QUANTISATION SEAM. Award values are all drawn from
-// {0.1, 0.25, 0.5, 0.75, 1.0}, but ripening and passive decay multiply, so they
-// produce values like 1.125 or 2.4750000000000001. Every write goes through
+// {0.1, 0.25, 0.5, 0.75, 1.0}, but ripening multiplies, so it produces values
+// like 1.125 or 2.4750000000000001. Every write goes through
 // setStat, and setStat calls this, so no code path can store a trailing decimal.
 //
 // Math.round(v / grain) * grain reintroduces float error of its own (0.05 is not
@@ -354,8 +354,16 @@ global.SMS.realmFor = stats => {
         return { realm: 'human', rule: `minTotal (total ${fmt(d.total)} < ${cfg.minTotal})` }
     }
 
-    // Rule 2. The poisons outweigh the antidotes: the player falls, and the
-    // dominant poison decides where.
+    // Rule 2. The poisons outweigh the antidotes AND carry real weight: the player
+    // falls, and the dominant poison decides where. Under lowerMinPoison a
+    // poison-led life falls through to rule 5 (human): rules 3 and 4 need Net of at
+    // least 0.50, so they cannot match here.
+    if (d.net < cfg.lowerNet && d.P < (cfg.lowerMinPoison || 0)) {
+        return {
+            realm: 'human',
+            rule: `human (net ${fmt(d.net)} < ${cfg.lowerNet}, but poison ${fmt(d.P)} < lowerMinPoison ${cfg.lowerMinPoison})`,
+        }
+    }
     if (d.net < cfg.lowerNet) {
         // `var`, not `const`: Rhino scopes const/let per FUNCTION, not per block, so
         // a const inside a nested block throws "redeclaration of var" the SECOND
@@ -737,9 +745,11 @@ global.SMS.resolveKiller = source => {
 // ---- Award -----------------------------------------------------------------
 
 // Award an act by name, reading both its value and its target stat from config.
-global.SMS.award = (player, act) => {
+// `amountOverride` replaces the configured value (hostile kills use it for their
+// per-life tiers); the stat always comes from config.
+global.SMS.award = (player, act, amountOverride) => {
     const cfg = global.SMS.config
-    const amount = cfg.karma[act]
+    const amount = amountOverride !== undefined ? amountOverride : cfg.karma[act]
     const stat = cfg.karmaStat[act]
     if (amount === undefined || !stat) {
         console.warn(`[Samsara] unknown karma act '${act}'`)
@@ -811,19 +821,23 @@ function entityId(entity) {
     }
 }
 
-// Would an animal-born player's action be cancelled anyway? Then do not pay for it.
-// samsara_realms.js cancels block placing for them, and handler order between files
-// is not guaranteed.
-function blockedByAnimalRealm(player, effect) {
-    try {
-        return !!global.SMS.effectsFor(global.SMS.birthRealmOf(player))[effect]
-    } catch (ignored) {
-        // realms script not loaded; fall through and treat as allowed
-        return false
-    }
-}
-
 // ---- Hatred: killing ------------------------------------------------------
+
+// The hatred a hostile kill adds, per config.hostileKillTiers, counting this kill.
+// Increments the per-life counter, so call it once per kill. 0 past the last tier.
+global.SMS.hostileKillAmount = player => {
+    const cfg = global.SMS.config
+    const tag = global.SMS.persistedTag(player)
+    var n = Number(tag.getDouble(cfg.nbt.lifeHostileKills))
+    if (!isFinite(n) || n < 0) n = 0
+    n = n + 1
+    tag.putDouble(cfg.nbt.lifeHostileKills, n)
+    var tiers = cfg.hostileKillTiers || []
+    for (var i = 0; i < tiers.length; i++) {
+        if (n <= tiers[i].upTo) return tiers[i].value
+    }
+    return 0
+}
 
 EntityEvents.death(event => {
     const victim = event.entity
@@ -853,7 +867,14 @@ EntityEvents.death(event => {
         act = 'killPassive'
     }
 
-    const r = global.SMS.award(killer, act)
+    // Hostile kills fall off within a life (config.hostileKillTiers).
+    var amount = undefined
+    if (act === 'killHostile') {
+        amount = global.SMS.hostileKillAmount(killer)
+        if (amount <= 0) return // past the per-life tiers: no further hatred this life
+    }
+
+    const r = global.SMS.award(killer, act, amount)
     if (!r) return
     console.info(
         `[Samsara] ${killer.profile.name} killed ${victim.type} (${kind}/${act}):` +
@@ -958,7 +979,7 @@ PlayerEvents.chestOpened(event => {
     if (placedContainers[posKey]) return
 
     const cfg = global.SMS.config.karmaAntiFarm
-    if (alreadyPaid(player, 'container', posKey, cfg.containerPositionTicks, cfg.plantMemoryMax)) return
+    if (alreadyPaid(player, 'container', posKey, cfg.containerPositionTicks, cfg.containerMemoryMax)) return
 
     const r = global.SMS.award(player, 'lootContainer')
     if (!r) return
@@ -1039,44 +1060,14 @@ BlockEvents.broken(event => {
     console.info(`[Samsara] ${breaker.profile.name} broke village block ${id}: +${r.amount} ${r.stat} -> ${r.total}`)
 })
 
-// ---- Metta: goodwill toward beings ----------------------------------------
-
-// Planting a crop: tending life rather than taking it.
+// ---- Generosity: feeding animals -------------------------------------------
 //
-// ANTI-FARM. Without a uniqueness check, breaking and replanting the SAME seed in
-// the SAME block paid every time, and click speed trivially outruns passive decay.
-BlockEvents.placed(event => {
-    const placer = event.entity
-    if (!placer || !placer.isPlayer()) return
-    if (!global.SMS.config.cropBlocks.includes(event.block.id)) return
-
-    // An animal-born player cannot place blocks at all (samsara_realms.js cancels
-    // this same event). Handler order between files is not guaranteed, so check here
-    // too rather than award metta for a placement that gets cancelled.
-    if (blockedByAnimalRealm(placer, 'noBlockPlacing')) return
-
-    const cfg = global.SMS.config.karmaAntiFarm
-    try {
-        var p = event.block.pos
-        var id = p.x + ',' + p.y + ',' + p.z
-        if (alreadyPaid(placer, 'plant', id, cfg.plantPositionTicks, cfg.plantMemoryMax)) return
-    } catch (ignored) {
-        // cannot read the position: fall through and award (fail open, once)
-    }
-
-    const r = global.SMS.award(placer, 'plantCrop')
-    if (!r) return
-    console.info(`[Samsara] ${placer.profile.name} planted ${event.block.id}: +${r.amount} ${r.stat} -> ${r.total}`)
-})
-
-// Feeding and taming, both through ItemEvents.entityInteracted.
+// Feeding is GIVING. AN 3.57: even throwing the rinsings of a bowl into a pool for
+// the creatures living there "would be a source of merit".
 //
 // Verified present in this build: ItemEntityInteractedEventJS exposes player,
-// entity (getTarget), hand and getItem.
-//
-// Taming is detected as "this animal had no Owner before the interaction and has
-// one after". The NBT is read on the next tick because the tame happens during
-// vanilla's own handling of the interaction, after this event fires.
+// entity (getTarget), hand and getItem. Feeding was verified in game 2026-10-18
+// (then as metta).
 ItemEvents.entityInteracted(event => {
     // CAREFUL: on THIS event, `entity` is the PLAYER and `target` is the animal.
     //
@@ -1088,18 +1079,15 @@ ItemEvents.entityInteracted(event => {
     // This is the OPPOSITE of every other handler in this file, where event.entity
     // is the mob (EntityEvents.death/hurt) or the actor (BlockEvents.placed/broken).
     // Reading event.entity as the animal here made target.isAnimal() false for a
-    // player, so the handler returned immediately and neither taming nor feeding
-    // ever awarded metta -- silently, with no error in the log.
+    // player, so the handler returned immediately and feeding never awarded --
+    // silently, with no error in the log.
     const player = event.player
     const target = event.target
     if (!player || !target) return
 
-    // isAnimal() maps to vanilla's Animal type. A WOLF is a TamableAnimal, which
-    // extends Animal, so it should pass -- but `isAnimal`'s implementation could not
-    // be located in the jar (it is an interface method with no findable mixin body),
-    // so its exact semantics here are UNVERIFIED. Rather than gate taming on an
-    // unverified predicate and fail closed again, the check is diagnostic: if it
-    // says no, log that fact and carry on to the explicit tameable list below.
+    // isAnimal() maps to vanilla's Animal type, but its implementation could not be
+    // located in the jar, so its semantics here are UNVERIFIED. The explicit list
+    // backs it up so feeding does not fail closed on a predicate we cannot read.
     var saysAnimal = false
     try {
         saysAnimal = target.isAnimal() === true
@@ -1107,9 +1095,7 @@ ItemEvents.entityInteracted(event => {
         saysAnimal = false
     }
 
-    // Explicit tameable list, independent of isAnimal(). These are the vanilla mobs
-    // that can gain an Owner, so they are the ones taming can ever apply to.
-    const TAMEABLE = [
+    const KNOWN_ANIMALS = [
         'minecraft:wolf',
         'minecraft:cat',
         'minecraft:ocelot',
@@ -1132,20 +1118,8 @@ ItemEvents.entityInteracted(event => {
     } catch (ignored) {
         targetType = ''
     }
-    const isTameable = TAMEABLE.indexOf(targetType) !== -1
+    if (!saysAnimal && KNOWN_ANIMALS.indexOf(targetType) === -1) return
 
-    if (!saysAnimal && !isTameable) return
-
-    if (!saysAnimal && isTameable) {
-        // Worth knowing: it means isAnimal() does NOT cover tameables in this build,
-        // and the explicit list is doing the work.
-        console.info(`[Samsara] note: isAnimal() returned false for ${targetType} (using tameable list)`)
-    }
-
-    // An unreadable or empty hand must NOT abort the handler: a horse is tamed by
-    // right-clicking it with an EMPTY hand, so returning here would make horses
-    // untameable for karma purposes. Default to '' and let the food check below
-    // simply find no match.
     var heldId = ''
     try {
         heldId = '' + event.item.id
@@ -1158,10 +1132,6 @@ ItemEvents.entityInteracted(event => {
     const id = entityId(target)
     if (!id) return
 
-    // Taming: did this interaction give the animal an owner?
-    const hadOwner = isBondedAnimal(target)
-
-    // Is the held item animal food?
     var isFood = false
     for (var i = 0; i < cfg.animalFoodSuffixes.length; i++) {
         if (heldId.endsWith(cfg.animalFoodSuffixes[i])) {
@@ -1169,34 +1139,9 @@ ItemEvents.entityInteracted(event => {
             break
         }
     }
-
-    // TAMING. The tame happens inside vanilla's handling of this interaction, which
-    // runs AFTER this event, so the Owner NBT is not set yet and cannot be read here.
-    //
-    // NOT done with scheduleInTicks. That method lives on MinecraftEnvironmentKJS
-    // with signature (J, ScheduledEvents$Callback) -- a Java `long` plus a functional
-    // interface, and the project notes record both as Rhino traps: longs do not coerce
-    // (trap 4) and arrow functions are NOT coerced into Java functional interfaces
-    // (trap 3, which stringifies the lambda). It would have failed silently.
-    //
-    // Instead the candidate is queued and checked by the tick handler below, using
-    // the pure-JS tick clock this project already maintains.
-    // Only queue mobs that can actually BE tamed, so right-clicking a cow with
-    // wheat does not add a pointless entry (and a pointless log line) every time.
-    if (!hadOwner && isTameable) {
-        global.SMS.pendingTames.push({
-            playerUuid: playerKey(player),
-            player: player,
-            target: target,
-            entityId: id,
-            at: global.SMS.tickClock || 0,
-        })
-    }
-
-    // Feeding: only pays for actual food, and only once per animal per window.
-    // Breeding already pays separately via breedAnimal, so without the window a
-    // stack of wheat would be a merit vending machine.
     if (!isFood) return
+
+    // Once per animal per window, or a stack of wheat is a merit vending machine.
     if (alreadyPaid(player, 'feed', id, farm.feedEntityTicks, farm.entityMemoryMax)) return
 
     const r = global.SMS.award(player, 'feedAnimal')
@@ -1204,140 +1149,274 @@ ItemEvents.entityInteracted(event => {
     console.info(`[Samsara] ${player.profile.name} fed ${target.type}: +${r.amount} ${r.stat} -> ${r.total}`)
 })
 
-// Pending tame checks, drained by the tick handler below.
+// ---- Metta: endurance (non-retaliation) ------------------------------------
 //
-// On global.SMS so it survives /reload rather than orphaning in-flight entries.
-global.SMS.pendingTames = global.SMS.pendingTames || []
-
-// Resolve queued tame candidates a few ticks after the interaction.
+// MN 21, the simile of the saw: "even if bandits were to carve you up savagely,
+// limb by limb, with a two-handled saw, he among you who let his heart get angered
+// even at that would not be doing my bidding." Metta here is NOT striking back at a
+// being that harms you -- by getting away, or by letting it kill you.
 //
-// An animal gets its Owner NBT during vanilla's handling of the right-click, after
-// ItemEvents.entityInteracted has already run. Waiting a couple of ticks and then
-// re-reading the NBT is what turns "player right-clicked a wolf with a bone" into
-// "the wolf is now owned", which is the only reliable tame signal available --
-// there is no tame event and no isTamed() on EntityKJS in this build.
-// 10 ticks (half a second), not 2. The tame is applied during vanilla's handling of
-// the interaction, so 2 ticks is usually enough -- but a wolf tame also triggers
-// particles, a sound, and a goal-selector rebuild, and leaving a wider margin costs
-// nothing (the queue is empty the rest of the time). Taming is probabilistic, so
-// most bone throws genuinely fail and will log "not owned"; that is expected.
-const TAME_CHECK_DELAY = 10
-const TAME_QUEUE_MAX = 64
+// AN ENCOUNTER opens when a hostile mob damages the player and closes after
+// config.endurance.quietTicks with no further hostile hit, or at the player's
+// death. It pays karma.enduredEncounter if the player took at least minDamage and
+// struck NO living thing during it (or in the quietTicks before it opened).
+//
+// What earns it is the restraint, so a death pays exactly what an escape pays.
+//
+// ANTI-FARM, one guard per exploit -- see config.endurance for why each exists:
+//   spawner mobs never count        (the caged-spawner AFK)
+//   one award per awardWindowTicks  (rapid repeats)
+//   perLifeMax per life             (the aggregate bound)
+//   no pay for a rapid repeat death (dying as the reset button for perLifeMax)
+//
+// State is in memory: an encounter only needs to outlast a few seconds. The
+// per-life total is in NBT, so a relog cannot reset it.
+//
+// Exposed on global.SMS.endurance so the offline harness drives the real logic.
 
-ServerEvents.tick(event => {
-    const queue = global.SMS.pendingTames
-    if (!queue || queue.length === 0) return
+const SPAWNER_MARK = 'samsara_from_spawner'
 
+global.SMS.encounters = global.SMS.encounters || {}
+global.SMS.lastViolence = global.SMS.lastViolence || {}
+
+function enduranceLog(msg) {
+    if (global.SMS.config.debugEndurance) console.info('[Samsara] endurance: ' + msg)
+}
+
+function isSpawnerMob(entity) {
+    try {
+        return entity.persistentData.getBoolean(SPAWNER_MARK) === true
+    } catch (ignored) {
+        return false
+    }
+}
+
+// Zero the per-life counters. Called at death, once the dying life's encounter
+// has been settled.
+global.SMS.resetLifeCounters = player => {
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    tag.putDouble(nbt.lifeHostileKills, 0)
+    tag.putDouble(nbt.lifeEndured, 0)
+}
+
+// Decide whether a closed encounter pays, and pay it. Returns the award or null.
+function settleEncounter(player, enc, how, isDeath) {
+    const cfg = global.SMS.config
+    const end = cfg.endurance
+    const name = player.profile.name
+
+    if (enc.spoiled) {
+        enduranceLog(`${name} ${how}: spoiled (struck back) -- nothing`)
+        return null
+    }
+    if (enc.damage < end.minDamage) {
+        enduranceLog(`${name} ${how}: only ${fmt(enc.damage)} damage < ${end.minDamage} -- nothing`)
+        return null
+    }
+    if (global.SMS.isLiberated(player)) return null
+
+    const tag = global.SMS.persistedTag(player)
     const now = global.SMS.tickClock || 0
-    const farm = global.SMS.config.karmaAntiFarm
 
-    // Walk backwards so splicing does not skip entries.
-    for (var i = queue.length - 1; i >= 0; i--) {
-        var q = queue[i]
-
-        // A negative age means the tick clock restarted (server restart); drop it
-        // rather than keeping it forever.
-        var age = now - q.at
-        if (age < 0) {
-            queue.splice(i, 1)
-            continue
-        }
-        if (age < TAME_CHECK_DELAY) continue
-
-        queue.splice(i, 1)
-
-        try {
-            if (!isBondedAnimal(q.target)) {
-                // Not tamed, which is the NORMAL case: taming is probabilistic, so
-                // most bone throws fail. Verified in game on 2026-10-18 -- an
-                // untamed wolf has no `Owner` key at all (contains(Owner)=false),
-                // and the key appears only once the tame actually lands.
-                //
-                // Deliberately NOT logged. This fires on every failed attempt, and
-                // the full-NBT dump that proved the behaviour was ~300 chars per
-                // line. Set config.debugTameChecks true to bring it back when
-                // investigating a taming problem.
-                if (global.SMS.config.debugTameChecks) {
-                    console.info(
-                        `[Samsara] tame check: ${q.target.type} not owned after ${age} ticks` +
-                            ` -- ${describeTameNbt(q.target)}`
-                    )
-                }
-                continue
-            }
-
-            // Pays once per animal, EVER: an animal can only be tamed once, so the
-            // window is effectively infinite.
-            if (alreadyPaid(q.player, 'tame', q.entityId, 2147483647, farm.entityMemoryMax)) continue
-
-            var tr = global.SMS.award(q.player, 'tameAnimal')
-            if (!tr) continue
-            console.info(
-                `[Samsara] ${q.player.profile.name} tamed ${q.target.type}:` +
-                    ` +${tr.amount} ${tr.stat} -> ${tr.total}`
-            )
-        } catch (ignored) {
-            // Entity despawned, player logged out, or NBT unreadable. Nothing to award.
+    // A death inside the ripening cooldown is a rapid repeat. lastDeathTick still
+    // holds the PREVIOUS death here: ripening (samsara_rebirth.js) writes it, and
+    // that handler registers after this file's.
+    if (isDeath && end.blockRapidDeath) {
+        var last = Number(tag.getDouble(cfg.nbt.lastDeathTick))
+        var since = now - last
+        if (tag.getBoolean(cfg.nbt.everDied) && since >= 0 && since < cfg.ripening.cooldownTicks) {
+            enduranceLog(`${name} ${how}: rapid repeat death -- nothing`)
+            return null
         }
     }
 
-    // Safety valve: if something ever stops draining this, do not grow without bound.
-    if (queue.length > TAME_QUEUE_MAX) queue.splice(0, queue.length - TAME_QUEUE_MAX)
+    // Aggregate bound, checked BEFORE the window: alreadyPaid records a payment
+    // whenever it returns false, so it must be the last gate.
+    const amount = cfg.karma.enduredEncounter
+    var paidThisLife = Number(tag.getDouble(cfg.nbt.lifeEndured))
+    if (!isFinite(paidThisLife) || paidThisLife < 0) paidThisLife = 0
+    if (paidThisLife + amount > end.perLifeMax + 1e-9) {
+        enduranceLog(`${name} ${how}: per-life cap ${end.perLifeMax} reached -- nothing`)
+        return null
+    }
+    if (alreadyPaid(player, 'endure', 'award', end.awardWindowTicks, 4)) {
+        enduranceLog(`${name} ${how}: inside the award window -- nothing`)
+        return null
+    }
+
+    const r = global.SMS.award(player, 'enduredEncounter')
+    if (!r) return null
+    tag.putDouble(cfg.nbt.lifeEndured, paidThisLife + amount)
+    console.info(
+        `[Samsara] ${name} endured (${how}, ${fmt(enc.damage)} damage, no retaliation):` +
+            ` +${r.amount} ${r.stat} -> ${r.total}`
+    )
+    return r
+}
+
+global.SMS.endurance = {
+    // A hostile `attacker` damaged `player` for `damage`.
+    onThreat: (player, attacker, damage) => {
+        const end = global.SMS.config.endurance
+        if (!end.enabled || !player || !attacker) return
+        try {
+            if (attacker.isPlayer()) return // PvP never counts: friends could farm it
+        } catch (ignored) {
+            return
+        }
+        if (global.SMS.classifyVictim(attacker) !== 'hostile') return
+        if (end.ignoreSpawnerMobs && isSpawnerMob(attacker)) {
+            enduranceLog(`${player.profile.name} hit by spawner mob ${attacker.type} -- ignored`)
+            return
+        }
+
+        var dmg = Number(damage)
+        if (!isFinite(dmg) || dmg <= 0) return
+
+        const key = playerKey(player)
+        const now = global.SMS.tickClock || 0
+        var enc = global.SMS.encounters[key]
+        if (!enc) {
+            // A strike shortly BEFORE the hit is still violence.
+            var lastV = global.SMS.lastViolence[key]
+            var preemptive = lastV !== undefined && now - lastV >= 0 && now - lastV < end.quietTicks
+            enc = { damage: 0, spoiled: preemptive, opened: now, lastHit: now }
+            global.SMS.encounters[key] = enc
+            enduranceLog(`${player.profile.name} encounter opened by ${attacker.type}` + (preemptive ? ' (already spoiled)' : ''))
+        }
+        enc.damage += dmg
+        enc.lastHit = now
+    },
+
+    // `player` struck a living thing.
+    onViolence: player => {
+        if (!player) return
+        const key = playerKey(player)
+        global.SMS.lastViolence[key] = global.SMS.tickClock || 0
+        var enc = global.SMS.encounters[key]
+        if (enc && !enc.spoiled) {
+            enc.spoiled = true
+            enduranceLog(`${player.profile.name} struck back -- encounter spoiled`)
+        }
+    },
+
+    // `player` died: settle any open encounter, then start the next life's counters.
+    onDeath: player => {
+        const key = playerKey(player)
+        var enc = global.SMS.encounters[key]
+        delete global.SMS.encounters[key]
+        delete global.SMS.lastViolence[key]
+        var r = null
+        if (enc) r = settleEncounter(player, enc, 'death', true)
+        global.SMS.resetLifeCounters(player)
+        return r
+    },
+
+    // Close every encounter that has gone quiet. `players` is the online list --
+    // a Java List in game (size/get), a JS array in the harness. Settling uses the
+    // ONLINE player object, never a stored one, which goes stale on relog.
+    drain: players => {
+        const end = global.SMS.config.endurance
+        const now = global.SMS.tickClock || 0
+        const keys = Object.keys(global.SMS.encounters)
+        var settled = []
+        for (var i = 0; i < keys.length; i++) {
+            var enc = global.SMS.encounters[keys[i]]
+            var age = now - enc.lastHit
+            if (age >= 0 && age < end.quietTicks) continue
+            delete global.SMS.encounters[keys[i]]
+            if (age < 0) continue // tick clock restarted; drop it
+
+            var online = null
+            var n = players ? (players.size ? players.size() : players.length) : 0
+            for (var j = 0; j < n; j++) {
+                var p = players.get ? players.get(j) : players[j]
+                if (playerKey(p) === keys[i]) {
+                    online = p
+                    break
+                }
+            }
+            if (!online) continue // logged out mid-encounter: nothing to pay
+            settled.push(settleEncounter(online, enc, 'escaped', false))
+        }
+        return settled
+    },
+}
+
+// Tag spawner-born mobs so they can never open an encounter.
+//
+// Jar-verified: CheckLivingEntitySpawnEventJS.getSpawner() -- "The spawner that
+// spawned the entity. Can be null if the entity was spawned by worldgen." The event
+// fires only for BaseSpawner and worldgen spawns, so non-null means a spawner.
+EntityEvents.checkSpawn(event => {
+    if (!global.SMS.config.endurance.ignoreSpawnerMobs) return
+    try {
+        if (event.spawner) event.entity.persistentData.putBoolean(SPAWNER_MARK, true)
+    } catch (ignored) {
+        // cannot tag it: it will count as natural, which only loosens one guard
+    }
 })
 
-// ---- Generosity: breeding -------------------------------------------------
+// Both halves of an encounter come through the hurt event.
+//
+// Jar-verified: LivingEntityHurtEventJS.getDamage() -- "The amount of damage."
+// (a float, which Rhino coerces; only Java long is the trap).
+EntityEvents.hurt(event => {
+    const victim = event.entity
+    if (!victim) return
+    const source = event.source
 
-// Breeding proxy: reward when a baby animal appears near a player.
-//
-// KubeJS 6 has no dedicated breed event, so this approximates it. Two bugs had to
-// be fixed here, and together they meant the proxy awarded nothing at all:
-//
-//   1. `isBaby()` DOES NOT EXIST anywhere in the jar. The call threw, the
-//      surrounding catch returned, and the handler exited every single time.
-//      Age is readable through NBT instead.
-//
-//   2. EntityEvents.spawned FIRES ON CHUNK LOAD. Its own javadoc says "This event
-//      also fires for existing entities when they are loaded from a save." So every
-//      pass over a farm re-awarded generosity for the same animals. Each animal is
-//      now marked once in its own persistent data, so a given baby pays out once.
-EntityEvents.spawned(event => {
-    if (!global.SMS.config.breedingProxyEnabled) return
-    const baby = event.entity
-    if (!baby) return
-
+    // 1. Violence: a real player struck a living thing (not themselves).
+    var striker = null
     try {
-        if (!baby.isAnimal()) return
+        striker = global.SMS.resolveKiller(source)
+    } catch (ignored) {
+        striker = null
+    }
+    if (striker && playerKey(striker) !== playerKey(victim)) {
+        global.SMS.endurance.onViolence(striker)
+    }
+
+    // 2. Threat: a hostile mob hurt a real player.
+    if (!isRealPlayer(victim)) return
+    var attacker = null
+    try {
+        attacker = source.actual
+    } catch (ignored) {
+        attacker = null
+    }
+    if (!attacker) return
+    try {
+        if (!attacker.isLiving()) return
     } catch (ignored) {
         return
     }
-
-    if (!isBabyAnimal(baby)) return
-
-    // Pay out at most once per animal, EVER. Without this, chunk reloads re-award.
-    const MARK = 'samsara_counted'
+    var dmg = 0
     try {
-        var pd = baby.persistentData
-        if (pd.getBoolean(MARK)) return
-        pd.putBoolean(MARK, true)
+        dmg = Number(event.damage)
     } catch (ignored) {
-        // Cannot mark it, so cannot guarantee once-only. Skip rather than risk a farm.
-        return
+        dmg = 0
     }
+    global.SMS.endurance.onThreat(victim, attacker, dmg)
+})
 
-    // NOTE: this is a Java List (EntityArrayList), not a JS array. Java 21's
-    // getFirst() is NOT available on it under Rhino. Use size()/get(0).
-    var players = null
+// Close quiet encounters. Same queue-and-drain pattern the tame check used (project
+// trap 10: scheduleInTicks is unusable here).
+ServerEvents.tick(event => {
+    if (Object.keys(global.SMS.encounters).length === 0) return
+    global.SMS.endurance.drain(event.server.players)
+})
+
+// A death settles the dying life's encounter and resets the per-life counters.
+EntityEvents.death(event => {
+    const player = event.entity
+    if (!player || !player.isPlayer()) return
     try {
-        players = baby.level.getEntitiesWithin(baby.boundingBox.inflate(16)).filter(e => e.isPlayer())
-    } catch (ignored) {
-        return
+        global.SMS.endurance.onDeath(player)
+    } catch (e) {
+        console.warn(`[Samsara] endurance death hook failed: ${e}`)
     }
-    if (!players || players.size() === 0) return
-    const parent = players.get(0)
-
-    const r = global.SMS.award(parent, 'breedAnimal')
-    if (!r) return
-    console.info(`[Samsara] baby ${baby.type} near ${parent.profile.name}: +${r.amount} ${r.stat} -> ${r.total}`)
 })
 
 // ---- Delusion: heedlessness ----------------------------------------------

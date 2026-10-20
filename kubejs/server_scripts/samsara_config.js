@@ -39,20 +39,27 @@ global.SMS.config = {
     // from {0.1, 0.25, 0.5, 0.75, 1.0}, whose finest common grain is 0.05, so
     // quantising here means a stat can never carry a trailing decimal beyond two
     // places. This is enforced in ONE place (global.SMS.setStat) so nothing can
-    // bypass it -- ripening and passive decay both produce values like
-    // 1.125 or 2.4750000000000001 otherwise.
+    // bypass it -- ripening produces values like 1.125 or 2.4750000000000001
+    // otherwise.
+    //
+    // CONSEQUENCE: any CHANGE smaller than half a grain (0.025) is rounded away. A
+    // multiplicative step on a small stat can therefore be a silent no-op -- this is
+    // what killed passive decay (1% of anything under 2.5 rounded straight back), see
+    // samsara_decay.js. Every award below is a whole number of grains for this reason.
     statGrain: 0.05,
 
     // ---- Karma point values -------------------------------------------------
     // Each entry says: this act adds this much to this stat. Values are additive
     // and positive -- a "bad" act grows a poison, it does not shrink an antidote.
     //
-    // Scaled for statCap = 10: killHostile at 0.1 means 100 hostiles to cap hatred,
-    // killVillager at 1.0 means ten villagers. Every value is from the agreed
+    // Scaled for statCap = 10: killVillager at 1.0 means ten villagers cap hatred.
+    // Hostile kills are capped per life instead (hostileKillTiers). Every value is from the agreed
     // increment set {0.1, 0.25, 0.5, 0.75, 1.0}.
     karma: {
         // --- Hatred: harming living things ---
-        killHostile: 0.1, // hostiles are cheapest -- combat is normal play here
+        // Hostiles are cheapest -- combat is normal play here. This is the FULL
+        // rate; it falls off within a life per hostileKillTiers below.
+        killHostile: 0.1,
         killPassive: 0.25, // animals and other peaceful mobs
         killVillager: 1.0, // villager-class: the heaviest single act in the game
         killTamed: 1.0, // a tamed or named animal: betrayal of a bond
@@ -68,12 +75,25 @@ global.SMS.config = {
         repeatDeath: 0.5, // died again inside the rapid-death window
 
         // --- Generosity (dana) ---
-        breedAnimal: 0.25, // caring for life (breeding proxy, see samsara_karma.js)
+        // Feeding an animal is GIVING. AN 3.57: even throwing the rinsings of a bowl
+        // into a pool for the creatures there "would be a source of merit". It was
+        // filed under metta before; the sutta files it under dana.
+        feedAnimal: 0.1,
 
-        // --- Metta: active goodwill toward beings ---
-        plantCrop: 0.1, // tending life rather than taking it
-        tameAnimal: 0.25, // taking an animal into your care
-        feedAnimal: 0.1, // feeding or healing an animal
+        // --- Metta: non-hatred (adosa) ---
+        // Metta comes from two sources only: meditation (phase 6, not built) and
+        // NON-RETALIATION -- taking real harm from a hostile and not striking back,
+        // whether by getting away or by letting it kill you. MN 21, the simile of the
+        // saw: "even if bandits were to carve you up savagely, limb by limb, with a
+        // two-handled saw, he among you who let his heart get angered even at that
+        // would not be doing my bidding." See config.endurance and samsara_karma.js.
+        //
+        // RETIRED: plantCrop, tameAnimal (metta) and breedAnimal (generosity).
+        // Planting for yourself is not goodwill toward a being, taming is acquiring a
+        // pet, and breeding is husbandry, not giving -- and its proxy paid for any
+        // baby that spawned near anyone. Retired 2026-10-19; the code is in git
+        // history (the first commit) if any of them comes back.
+        enduredEncounter: 0.25,
 
         // --- Wisdom (panna) ---
         // DELIBERATELY EMPTY. Wisdom comes from insight: the Four Sights, realm
@@ -105,11 +125,76 @@ global.SMS.config = {
         carelessDeath: 'delusion',
         repeatDeath: 'delusion',
 
-        breedAnimal: 'generosity',
+        feedAnimal: 'generosity',
 
-        plantCrop: 'metta',
-        tameAnimal: 'metta',
-        feedAnimal: 'metta',
+        enduredEncounter: 'metta',
+    },
+
+    // ---- Hostile kills fall off within a life -------------------------------
+    // Without passive decay, every hostile kill is permanent until it ripens. At a
+    // flat 0.1, twenty zombies took a fresh player to total 2.0 = minTotal with no
+    // antidotes, i.e. Net 0 -> NARAKA after one ordinary night (measured 2026-10-19).
+    //
+    // Each tier pays `value` per kill until the player's hostile-kill count THIS LIFE
+    // reaches `upTo`; past the last tier a hostile kill adds nothing. The counter
+    // resets at death (global.SMS.resetLifeCounters).
+    //
+    // The per-life total MUST stay below routing.minTotal, or hostiles alone send a
+    // pure-combat player down on their first life. Here: 10 x 0.1 + 10 x 0.05 = 1.5.
+    // The harness checks that invariant.
+    //
+    // A GAME CONCESSION, not doctrine. The first precept makes no exception for
+    // hostile beings. The world forces combat on the player; this keeps that from
+    // being the whole verdict, while killing passives and villagers stays full price.
+    // Values must be whole grains (statGrain) or they round to nothing.
+    hostileKillTiers: [
+        { upTo: 10, value: 0.1 },
+        { upTo: 20, value: 0.05 },
+    ],
+
+    // ---- Endurance: metta from non-retaliation ------------------------------
+    // An ENCOUNTER opens when a hostile mob damages the player, and closes after
+    // quietTicks with no further hostile hits, or at the player's death. It pays
+    // karma.enduredEncounter (metta) if, by then:
+    //   - the player took at least minDamage across it (real harm, not a scratch);
+    //   - the player struck NO living thing during it, or in the quietTicks before
+    //     it opened (a pre-emptive strike is still violence);
+    // and the guards below allow it.
+    //
+    // What earns it is NOT striking back -- the death itself pays nothing extra. MN 21
+    // praises the mind that does not hate under harm, not the dying.
+    endurance: {
+        enabled: true,
+
+        // Damage summed across the encounter, as reported by the hurt event (before
+        // armor). 4.0 = two hearts: about two zombie hits.
+        minDamage: 4.0,
+
+        // 200 ticks = 10 s without a hostile hit closes the encounter.
+        quietTicks: 200,
+
+        // ---- Anti-farm. Each bounds a different exploit; all are needed. ----
+
+        // Mobs from a spawner (BaseSpawner) never open an encounter. Tagged at spawn
+        // via EntityEvents.checkSpawn, whose getSpawner() is null for natural spawns.
+        // This is what stops "stand next to a caged spawner".
+        ignoreSpawnerMobs: true,
+
+        // At most one award per this window. 6000 = 5 min.
+        awardWindowTicks: 6000,
+
+        // AGGREGATE bound: metta from endurance per life never exceeds this.
+        // Resets at death, so it bounds a life, not the whole save -- see
+        // blockRapidDeath for what stops dying from becoming the reset button.
+        perLifeMax: 1.0,
+
+        // An encounter that ends in DEATH pays only if the previous death was at
+        // least ripening.cooldownTicks ago. Mob deaths add no delusion (there is an
+        // attacker), and each death resets perLifeMax, so without this a player could
+        // let a zombie kill them every few minutes for unbounded metta. With it, a
+        // death farm pays at most once per cooldown and each death ripens 20% of
+        // metta, so it converges (to ~1.0) instead of climbing. Harness-measured.
+        blockRapidDeath: true,
     },
 
     // ---- Rebirth routing ----------------------------------------------------
@@ -146,6 +231,14 @@ global.SMS.config = {
         // Rule 2. Below this Net, the player falls. 0.40 means poison must outweigh
         // antidote by roughly 3:2 before a lower rebirth happens.
         lowerNet: 0.40,
+
+        // Rule 2 ALSO needs this much poison in absolute terms (P). Shares alone
+        // judge a life by its balance the moment minTotal is cleared, so an ordinary
+        // player killing a few animals for food fell to naraka inside an hour. This
+        // is the weight a life must carry before it tips downward -- AN 3.99's salt
+        // crystal: a little evil does not ruin a whole river. Below it, a poison-led
+        // life is still human (rules 3/4 cannot match at Net < 0.40).
+        lowerMinPoison: 6.0,
 
         // Rule 3. Deva: real merit, but no insight. Virtue without wisdom is the
         // classic deva trap -- a pleasant birth that burns through its own merit.
@@ -252,6 +345,10 @@ global.SMS.config = {
         // 12000 ticks = 10 real minutes.
         cooldownTicks: 12000,
         repeatFalloff: 0.35,
+
+        // Values at or below this after ripening are zeroed, so stats actually reach
+        // 0. One statGrain step. (Moved here from the retired `decay` block.)
+        floor: 0.05,
     },
 
     // ---- Realm -> dimension mapping -----------------------------------------
@@ -395,32 +492,21 @@ global.SMS.config = {
         'campfire', // cooking station
     ],
 
-    // ---- Passive karma decay ------------------------------------------------
-    // Karma is not a permanent ledger: in Buddhist thought a birth ends when the
-    // karma that produced it is exhausted, so karma must wear away with time too,
-    // not only at death.
+    // ---- Passive karma decay: RETIRED 2026-10-19 ----------------------------
+    // There is no passive decay. Karma falls only by ripening at rebirth, and is
+    // diluted by antidotes (routing works on shares).
     //
-    // Proportional rather than flat, so a large debt sheds quickly at first and then
-    // slows, while small amounts linger instead of snapping to zero.
-    decay: {
-        enabled: true,
-
-        // 6000 ticks = 5 real minutes. At 1% per 5 min a stat halves in ~5.7 hours
-        // of play.
-        intervalTicks: 6000,
-        fraction: 0.01,
-
-        // WISDOM DECAYS MUCH MORE SLOWLY. Insight is meant to carry across lives
-        // (config.ripening.wisdomRate), and a 1%/5min passive drain would erode the
-        // one stat designed to persist. This multiplies the fraction above for
-        // wisdom only: 0.01 * 0.1 = 0.1% per 5 minutes.
-        wisdomFactionMultiplier: 0.1,
-
-        // Values at or below this are rounded away, so stats actually reach zero
-        // instead of trailing infinitesimals forever. On the 0..10 scale this is
-        // one statGrain step.
-        floor: 0.05,
-    },
+    // Doctrine: Dhp 71 -- "an evil deed committed does not immediately bear fruit,
+    // like milk that does not turn sour all at once; but smoldering, it follows the
+    // fool like fire covered by ashes." AN 3.99 (the salt crystal) says what weakens
+    // a bad deed's result is the person's DEVELOPMENT, not time.
+    //
+    // It was also broken and dangerous. Broken: 1% of any stat at or under 2.5 is
+    // under half a grain, so quantisation rounded it straight back -- every stat
+    // froze at 2.5, and wisdom (0.1%) never moved at all. Dangerous: fixing that
+    // naively let wisdom's share rise while the player idled, and a measured AFK
+    // player reached liberation in 11 hours. Do not reintroduce it without a test
+    // that measures both.
 
     // ---- Victim classification overrides ------------------------------------
     // isMonster() maps to vanilla's Monster/Enemy type, which puts several mobs on the
@@ -455,23 +541,17 @@ global.SMS.config = {
     // Merit has to be hard to manufacture, and harm has to be hard to launder, or
     // routing means nothing. These guard the award hooks against repetition.
     karmaAntiFarm: {
-        // Replanting the same block position does not pay again inside this window.
-        // 24000 ticks = 20 real minutes, comfortably longer than a crop takes to
-        // grow, so genuine farming still earns while break-replace spam does not.
-        plantPositionTicks: 24000,
-
-        // Cap on remembered plant positions per player before pruning. Keeps the
+        // Cap on remembered container positions per player before pruning. Keeps the
         // in-memory map bounded over a long session.
-        plantMemoryMax: 512,
+        containerMemoryMax: 512,
 
         // Hitting the same mob repeatedly pays hatred once per this window.
         // 1200 ticks = 1 real minute. Without it, hurtPassive would charge per swing
         // and a single cow could cap hatred.
         hurtEntityTicks: 1200,
 
-        // Feeding the same animal pays metta once per this window. 6000 = 5 min.
-        // Breeding already pays separately via breedAnimal, so without this a stack
-        // of wheat would be a merit vending machine.
+        // Feeding the same animal pays generosity once per this window. 6000 = 5 min.
+        // Without it a stack of wheat would be a merit vending machine.
         feedEntityTicks: 6000,
 
         // Cap on remembered entities for the two guards above, per player.
@@ -482,20 +562,6 @@ global.SMS.config = {
         // not charge per click.
         containerPositionTicks: 24000,
     },
-
-    // ---- Which blocks count as "planting a crop" ----------------------------
-    cropBlocks: [
-        'minecraft:wheat',
-        'minecraft:carrots',
-        'minecraft:potatoes',
-        'minecraft:beetroots',
-        'minecraft:nether_wart',
-        'minecraft:melon_stem',
-        'minecraft:pumpkin_stem',
-        'minecraft:torchflower_crop',
-        'minecraft:pitcher_crop',
-        'minecraft:cocoa',
-    ],
 
     // ---- Villager infrastructure (greed: breakVillagerBlock) ----------------
     // Breaking one of these within `villagerBlockRadius` of a living villager reads
@@ -850,16 +916,10 @@ global.SMS.config = {
     // trace in the log at all. Turn off once it is confirmed working.
     debugFood: true,
 
-    // Log the full NBT of a tame candidate that did not resolve. Off by default:
-    // taming is probabilistic, so this fires on every failed bone throw and the
-    // dump is ~300 chars a line. Turn on only when investigating taming.
-    debugTameChecks: false,
-
-    // ---- Toggles ------------------------------------------------------------
-    // Breeding has no dedicated event in KubeJS 6, so we approximate it by
-    // rewarding whenever a baby animal spawns. This also fires for babies from
-    // spawn eggs / natural spawns. Set false to disable until a cleaner hook exists.
-    breedingProxyEnabled: true,
+    // Log every endurance encounter as it opens, spoils and closes. On while the
+    // mechanic is unverified in game: like the food hook, every path through it is a
+    // silent return otherwise. Turn off once confirmed.
+    debugEndurance: true,
 
     // ---- NBT keys -----------------------------------------------------------
     // Stored inside the Forge PlayerPersisted tag (survives death + relog).
@@ -888,6 +948,10 @@ global.SMS.config = {
         lastDeathTick: 'samsara_last_death_tick',
         deathStreak: 'samsara_death_streak',
         everDied: 'samsara_ever_died',
+
+        // Per-LIFE counters, zeroed at death by global.SMS.resetLifeCounters.
+        lifeHostileKills: 'samsara_life_hostile_kills', // drives hostileKillTiers
+        lifeEndured: 'samsara_life_endured', // metta paid by endurance this life
 
         // Liberation: set once the player passes the check. Skips rebirth entirely.
         liberated: 'samsara_liberated',

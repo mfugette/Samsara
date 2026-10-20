@@ -351,10 +351,12 @@ ServerEvents.commandRegistry(event => {
                         const nbt = global.SMS.config.nbt
                         const tag = global.SMS.persistedTag(target)
 
-                        // 1. The six stats.
+                        // 1. The six stats and the per-life counters (hostile-kill
+                        //    tiers, endurance cap).
                         for (var i = 0; i < global.SMS.STATS.length; i++) {
                             global.SMS.setStat(target, global.SMS.STATS[i], 0)
                         }
+                        global.SMS.resetLifeCounters(target)
 
                         // 2. Testing overrides and the liberation flag.
                         tag.putString(nbt.forcedRealm, '')
@@ -387,7 +389,7 @@ ServerEvents.commandRegistry(event => {
                         reply(ctx, Text.green(`${target.profile.name}'s karma reset to baseline`))
                         return reply(
                             ctx,
-                            Text.gray('  six stats 0, born human, forcerealm/liberated cleared, death streak reset')
+                            Text.gray('  six stats 0, born human, forcerealm/liberated cleared, death streak + life counters reset')
                         )
                     })))
             .then(C.literal('show')
