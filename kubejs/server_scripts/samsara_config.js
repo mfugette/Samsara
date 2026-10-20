@@ -81,11 +81,13 @@ global.SMS.config = {
         breakVillagerBlock: 3, // destroyed a villager workstation or bed
 
         // --- Delusion: heedlessness (moha) ---
-        // Deaths are the ONLY delusion source today, and each death also ripens 20%
-        // of everything -- measured, delusion alone plateaus around 12 and can never
-        // reach lowerMinPoison, so the ANIMAL REALM IS EFFECTIVELY GATED until a
-        // non-death source exists. Planned: intoxicants (the fifth precept;
-        // heedlessness, Dhp 21) as a delusion source, added by this mod later.
+        // Deaths are the ONLY delusion source today. For ordinary carelessness each
+        // death also ripens 20% of everything, so delusion plateaus around 12 and
+        // never reaches lowerMinPoison. BUT RAPID DEATH-SPAM IS UNBOUNDED: each
+        // repeatDeath adds 5 while the ripening falloff shrinks toward 0, and in game
+        // (2026-10-19) ~20 deaths in a minute routed to animal. Open decision -- see
+        // HANDOFF section 4. Planned non-death source: intoxicants (the fifth
+        // precept; heedlessness, Dhp 21), added by this mod later.
         carelessDeath: 2, // died with nobody to blame -- fall, lava, drowning
         repeatDeath: 5, // died again inside the rapid-death window
 
