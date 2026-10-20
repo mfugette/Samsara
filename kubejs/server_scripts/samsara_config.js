@@ -926,10 +926,12 @@ global.SMS.config = {
     // trace in the log at all. Turn off once it is confirmed working.
     debugFood: true,
 
-    // Log every endurance encounter as it opens, spoils and closes. On while the
-    // mechanic is unverified in game: like the food hook, every path through it is a
-    // silent return otherwise. Turn off once confirmed.
-    debugEndurance: true,
+    // Log every endurance encounter as it opens, spoils and closes. Like the food
+    // hook, every path through it is a silent return otherwise. OFF since the
+    // 2026-10-20 in-game test confirmed the open / spoiled / spawner / award-window /
+    // death paths; turn it back on to debug endurance. (The award line itself is
+    // always logged.)
+    debugEndurance: false,
 
     // ---- NBT keys -----------------------------------------------------------
     // Stored inside the Forge PlayerPersisted tag (survives death + relog).
