@@ -1545,6 +1545,15 @@ EntityEvents.death(event => {
 // same one ripening uses, read BEFORE ripening updates it (handler order within the
 // same event is registration order, and samsara_karma.js loads before
 // samsara_rebirth.js alphabetically).
+//
+// BOUNDED PER BURST. The first repeat pays the full repeatDeath; each later one in
+// the same unbroken run pays repeatFalloff times the one before (5, 1.75, 0.61,
+// ...), so a burst of any length adds at most carelessDeath + repeatDeath /
+// (1 - repeatFalloff) ~ 9.7. A flat repeatDeath was unbounded: ripening's falloff
+// shrinks toward 0 during a burst, so nothing took it away, and in game
+// (2026-10-19) ~20 deaths in a minute routed to animal -- and a hell-born player
+// could die until delusion overtook hatred, escaping naraka into animal. Harness
+// section 16h.
 EntityEvents.death(event => {
     const player = event.entity
     if (!player || !player.isPlayer()) return
@@ -1568,25 +1577,30 @@ EntityEvents.death(event => {
         // no attacker; genuinely environmental
     }
 
-    const nbt = global.SMS.config.nbt
-    const rip = global.SMS.config.ripening
-    const tag = global.SMS.persistedTag(player)
-    const now = global.SMS.tickClock || 0
+    const cfg = global.SMS.config
 
-    // Is this a repeat inside the rapid-death window?
+    // Is this a repeat inside the rapid-death window, and how far into the run?
     var act = 'carelessDeath'
+    var amount = undefined // undefined = the configured value
+    var streak = 0
     try {
-        var last = Number(tag.getDouble(nbt.lastDeathTick))
-        var ever = tag.getBoolean(nbt.everDied)
-        var since = now - last
-        if (ever && since >= 0 && since < rip.cooldownTicks) act = 'repeatDeath'
+        streak = global.SMS.rapidDeathStreak(player)
+        if (streak >= 1) {
+            act = 'repeatDeath'
+            amount = cfg.karma.repeatDeath * Math.pow(cfg.ripening.repeatFalloff, streak - 1)
+        }
     } catch (ignored) {
         act = 'carelessDeath'
+        amount = undefined
+        streak = 0
     }
 
-    const r = global.SMS.award(player, act)
+    const r = global.SMS.award(player, act, amount)
     if (!r) return
-    console.info(`[Samsara] ${player.profile.name} died carelessly (${act}): +${r.amount} ${r.stat} -> ${r.total}`)
+    console.info(
+        `[Samsara] ${player.profile.name} died carelessly (${act}, rapid-death streak ${streak}):` +
+            ` +${fmt(r.amount)} ${r.stat} -> ${fmt(r.total)}`
+    )
 })
 
 console.info('[Samsara] karma hooks registered')

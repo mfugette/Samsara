@@ -84,6 +84,33 @@ ServerEvents.tick(event => {
 
 // ---- Ripening --------------------------------------------------------------
 
+// The rapid-death streak: how many deaths in an unbroken run, each inside
+// ripening.cooldownTicks of the one before, the player had ALREADY died before
+// this one. 0 means this death starts fresh (no recent death, or none ever).
+//
+// One reader for two consumers, so they cannot drift apart: ripenKarma scales its
+// rates by repeatFalloff^streak, and the delusion award (samsara_karma.js) scales a
+// repeat death's delusion by repeatFalloff^(streak-1). Both must call this BEFORE
+// ripenKarma records the current death; the delusion handler does, because
+// samsara_karma.js registers its death handler before samsara_rebirth.js.
+//
+// NOTE: putDouble/getDouble only. getLong/getInt are unverified on this
+// CompoundTag binding, and an unsupported NBT method fails SILENTLY here rather
+// than throwing -- a double represents tick counts and small ints exactly.
+global.SMS.rapidDeathStreak = player => {
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    const now = global.SMS.tickClock || 0
+    const last = Number(tag.getDouble(nbt.lastDeathTick))
+    const since = now - last
+
+    // A negative `since` (clock restarted) counts as "long ago" rather than being
+    // trusted.
+    if (!tag.getBoolean(nbt.everDied) || since < 0 || since >= global.SMS.config.ripening.cooldownTicks) return 0
+    const streak = Number(tag.getDouble(nbt.deathStreak))
+    return isFinite(streak) && streak > 0 ? streak : 0
+}
+
 // Spend the karma that produced a birth, now that the birth has ended.
 //
 // `realm` is the realm the player is being reborn INTO, which is also the realm
@@ -98,7 +125,9 @@ ServerEvents.tick(event => {
 // ANTI-FARM. Each death inside cooldownTicks of the previous one multiplies every
 // rate by repeatFalloff again, so the 1st death ripens fully, the 2nd ~35%, the
 // 3rd ~12%. Without it a player stuck in hell could suicide repeatedly to ripen
-// their hatred away and any escape task would be pointless.
+// their hatred away and any escape task would be pointless. The delusion a rapid
+// death ADDS falls off on the same streak (samsara_karma.js) -- see
+// rapidDeathStreak above.
 //
 // Returns a small report for logging, or null when ripening is off.
 global.SMS.ripenKarma = (player, realm) => {
@@ -108,21 +137,7 @@ global.SMS.ripenKarma = (player, realm) => {
     const nbt = global.SMS.config.nbt
     const tag = global.SMS.persistedTag(player)
     const now = global.SMS.tickClock || 0
-
-    // NOTE: putDouble/getDouble only. getLong/getInt are unverified on this
-    // CompoundTag binding, and an unsupported NBT method fails SILENTLY here rather
-    // than throwing -- a double represents tick counts and small ints exactly.
-    const last = Number(tag.getDouble(nbt.lastDeathTick))
-    const everDied = tag.getBoolean(nbt.everDied)
-    const since = now - last
-
-    // Fresh start if the player has not died recently (or ever). A negative `since`
-    // (clock restarted) counts as "long ago" rather than being trusted.
-    var streak = 0
-    if (everDied && since >= 0 && since < cfg.cooldownTicks) {
-        streak = Number(tag.getDouble(nbt.deathStreak))
-        if (!isFinite(streak) || streak < 0) streak = 0
-    }
+    const streak = global.SMS.rapidDeathStreak(player)
 
     // The falloff multiplier applied to every rate below.
     const falloff = Math.pow(cfg.repeatFalloff, streak)

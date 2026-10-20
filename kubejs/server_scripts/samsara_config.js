@@ -83,13 +83,14 @@ global.SMS.config = {
         // --- Delusion: heedlessness (moha) ---
         // Deaths are the ONLY delusion source today. For ordinary carelessness each
         // death also ripens 20% of everything, so delusion plateaus around 12 and
-        // never reaches lowerMinPoison. BUT RAPID DEATH-SPAM IS UNBOUNDED: each
-        // repeatDeath adds 5 while the ripening falloff shrinks toward 0, and in game
-        // (2026-10-19) ~20 deaths in a minute routed to animal. Open decision -- see
-        // HANDOFF section 4. Planned non-death source: intoxicants (the fifth
-        // precept; heedlessness, Dhp 21), added by this mod later.
+        // never reaches lowerMinPoison. Rapid death-spam is BOUNDED PER BURST:
+        // repeatDeath is what the FIRST repeat pays, and each later one in the same
+        // run pays ripening.repeatFalloff times the one before, so a burst adds at
+        // most 2 + 5 / (1 - 0.35) ~ 9.7. (A flat 5 was unbounded: in game,
+        // 2026-10-19, ~20 deaths in a minute routed to animal.) Planned non-death
+        // source: intoxicants (the fifth precept; heedlessness, Dhp 21).
         carelessDeath: 2, // died with nobody to blame -- fall, lava, drowning
-        repeatDeath: 5, // died again inside the rapid-death window
+        repeatDeath: 5, // the first repeat inside the rapid-death window; later ones fall off
 
         // --- Generosity (dana) ---
         // Feeding an animal is GIVING. AN 3.57: even throwing the rinsings of a bowl
