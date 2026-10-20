@@ -30,12 +30,9 @@ global.SMS = global.SMS || {}
 // so stats actually reach 0 rather than trailing infinitesimals forever.
 //
 // Every write goes through global.SMS.setStat, which clamps to [0, statCap] and
-// quantises to config.statGrain -- so multiplying can never leave a trailing
-// decimal behind. Returns the total amount removed, for logging.
-//
-// NOTE: a reduction under half a grain (0.025) rounds back to the old value, so a
-// small rate on a small stat is a no-op. That is what silently killed passive
-// decay. Ripening's rates (>= 10%) only stall below 0.25, which is acceptable.
+// strips float noise. Storage is exact (no grain since the 2026-10-19 unit
+// redesign), so even a small rate on a small stat really moves it. Returns the
+// total amount removed, for logging.
 global.SMS.scaleStats = (player, keep, keys) => {
     const cfg = global.SMS.config.ripening
     const stats = keys || global.SMS.STATS
@@ -135,12 +132,18 @@ global.SMS.ripenKarma = (player, realm) => {
     const isHigher = realmKey === 'deva' || realmKey === 'asura'
 
     const stats = global.SMS.getStats(player)
+    // Hatred before ripening, so the combat sub-count can be scaled with it below.
+    const hatredBefore = Number(stats.hatred)
+    const combatBefore = Number(stats.hatredCombat) || 0
     var removed = 0
     var detail = ''
 
     if (isLower) {
-        // Spend the specific poison that sent them down.
-        var lead = global.SMS.dominantOf(stats, global.SMS.POISONS)
+        // Spend the poison that SENT them there -- read off the realm, not
+        // recomputed. Routing picks the realm with combat hatred set aside
+        // (global.SMS.judgedPoisons), so a raw "largest poison" here could disagree
+        // with it and spend the wrong one.
+        var lead = realmKey === 'naraka' ? 'hatred' : realmKey === 'preta' ? 'greed' : 'delusion'
         removed += global.SMS.scaleStats(player, 1 - cfg.lowerDominantPoison * falloff, [lead])
         detail = `${lead} -${Math.round(cfg.lowerDominantPoison * falloff * 100)}%`
     } else if (isHigher) {
@@ -164,6 +167,14 @@ global.SMS.ripenKarma = (player, realm) => {
     // over. Applied last so no branch above can have touched it.
     removed += global.SMS.scaleStats(player, 1 - cfg.wisdomRate * falloff, ['wisdom'])
     detail += ` wisdom -${Math.round(cfg.wisdomRate * falloff * 100)}%`
+
+    // Combat hatred is PART of hatred, so it ripens in the same proportion.
+    // Without this it would outlive the hatred it belongs to (it is clamped on read,
+    // but the share would drift: a halved hatred would read as mostly combat).
+    if (combatBefore > 0 && hatredBefore > 0) {
+        var hatredAfter = Number(global.SMS.getStat(player, 'hatred'))
+        global.SMS.setCombatHatred(player, combatBefore * (hatredAfter / hatredBefore))
+    }
 
     // Record the death for the next falloff calculation.
     tag.putDouble(nbt.lastDeathTick, now)

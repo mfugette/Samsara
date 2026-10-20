@@ -27,33 +27,31 @@ global.SMS.persistedTag = player => {
 
 const statKey = stat => global.SMS.config.nbt.statPrefix + stat
 
-// Round to a multiple of config.statGrain.
+// Strip float noise (config.storePrecision) before a write.
 //
-// THE SINGLE QUANTISATION SEAM. Award values are all drawn from
-// {0.1, 0.25, 0.5, 0.75, 1.0}, but ripening multiplies, so it produces values
-// like 1.125 or 2.4750000000000001. Every write goes through
-// setStat, and setStat calls this, so no code path can store a trailing decimal.
-//
-// Math.round(v / grain) * grain reintroduces float error of its own (0.05 is not
-// exact in binary), so the result is rounded to 2 decimal places afterwards. At
-// grain 0.05 two places is exact.
-global.SMS.quantize = value => {
-    const grain = global.SMS.config.statGrain
-    if (!grain || grain <= 0) return value
-    var steps = Math.round(value / grain)
-    return Math.round(steps * grain * 100) / 100
+// THIS IS NOT A GRAIN. The old seam rounded every write to 0.05, which silently
+// swallowed any change under 0.025 -- it killed passive decay outright. This only
+// removes binary-float residue (0.1 + 0.2 = 0.30000000000000004) so a stat cannot
+// sit a hair under a threshold; at 1e-6 it is a million times finer than the
+// smallest award and can never eat a real change. Rounds via an integer inverse,
+// because dividing by 1e-6 reintroduces the very residue it exists to remove.
+global.SMS.roundStore = value => {
+    const prec = global.SMS.config.storePrecision
+    if (!prec || prec <= 0) return value
+    const inv = Math.round(1 / prec)
+    return Math.round(value * inv) / inv
 }
 
 global.SMS.getStat = (player, stat) => global.SMS.persistedTag(player).getDouble(statKey(stat))
 
-// Clamp to [0, statCap], quantise, store.
+// Clamp to [0, statCap] (an overflow ceiling, not a design cap), round, store.
 global.SMS.setStat = (player, stat, value) => {
     const cap = global.SMS.config.statCap
     var v = Number(value)
     if (!isFinite(v)) v = 0
     if (v < 0) v = 0
     if (v > cap) v = cap
-    v = global.SMS.quantize(v)
+    v = global.SMS.roundStore(v)
     global.SMS.persistedTag(player).putDouble(statKey(stat), v)
     return v
 }
@@ -61,13 +59,46 @@ global.SMS.setStat = (player, stat, value) => {
 global.SMS.addStat = (player, stat, delta) =>
     global.SMS.setStat(player, stat, global.SMS.getStat(player, stat) + delta)
 
-// All six stats as a plain object.
+// ---- Combat hatred: the part of hatred that came from hostile kills -----------
+//
+// Counted in hatred like any other, but routing ignores it when deciding asura and
+// WHICH lower realm a life falls to (config.hostileKillTiers explains why). Always
+// read clamped to hatred: an admin `/karma set <p> hatred 0`, or ripening, must
+// never leave a sub-count larger than the stat it is part of.
+global.SMS.getCombatHatred = player => {
+    var c = Number(global.SMS.persistedTag(player).getDouble(global.SMS.config.nbt.hatredCombat))
+    if (!isFinite(c) || c < 0) c = 0
+    var h = Number(global.SMS.getStat(player, 'hatred'))
+    return c > h ? h : c
+}
+
+global.SMS.setCombatHatred = (player, value) => {
+    var v = Number(value)
+    if (!isFinite(v) || v < 0) v = 0
+    var h = Number(global.SMS.getStat(player, 'hatred'))
+    if (v > h) v = h
+    v = global.SMS.roundStore(v)
+    global.SMS.persistedTag(player).putDouble(global.SMS.config.nbt.hatredCombat, v)
+    return v
+}
+
+global.SMS.addCombatHatred = (player, delta) =>
+    global.SMS.setCombatHatred(player, global.SMS.getCombatHatred(player) + delta)
+
+// All six stats as a plain object, plus `hatredCombat` (part of hatred, not a
+// seventh stat -- derive() sums POISONS/ANTIDOTES only, so it never double-counts).
+//
+// Runs the migrations first if this player has not had them. They normally run at
+// login, but a player who is online across a /reload never logs in again, and
+// without this their old-scale stats would mix with new-unit awards.
 global.SMS.getStats = player => {
+    global.SMS.ensureMigrated(player)
     const out = {}
     const stats = global.SMS.STATS
     for (let i = 0; i < stats.length; i++) {
         out[stats[i]] = global.SMS.getStat(player, stats[i])
     }
+    out.hatredCombat = global.SMS.getCombatHatred(player)
     return out
 }
 
@@ -200,6 +231,35 @@ function migrateRenameAndRescale(player) {
     }
 }
 
+// v3: the 0..10 scale in 0.05 steps -> exact UNITS (one unit = striking an animal
+// once). Every old award value was a tenth of its new one (killHostile 0.1 -> 1,
+// killPassive 0.25 -> ~3), so x10 maps an old ledger onto the new scale with its
+// balance intact -- routing reads shares, so the verdict does not move.
+//
+// The per-life endurance total was stored in old units; it is zeroed rather than
+// rescaled, which can cost at most one life's endurance cap. The combat sub-count
+// did not exist before v3, so existing hatred is all treated as non-combat.
+function migrateToUnits(player) {
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    if (tag.getBoolean(nbt.migratedV3)) return
+
+    const factor = 10
+    const stats = global.SMS.STATS
+    var touched = false
+    for (var i = 0; i < stats.length; i++) {
+        var raw = tag.getDouble(statKey(stats[i]))
+        if (raw > 0) {
+            global.SMS.setStat(player, stats[i], raw * factor)
+            touched = true
+        }
+    }
+    tag.putDouble(nbt.lifeEndured, 0)
+    tag.putBoolean(nbt.migratedV3, true)
+
+    if (touched) console.info(`[Samsara] v3 migration: rescaled x${factor} to units for ${player.profile.name}`)
+}
+
 global.SMS.migrateKarma = player => {
     try {
         migrateLegacyScalar(player)
@@ -211,6 +271,21 @@ global.SMS.migrateKarma = player => {
     } catch (e) {
         console.warn(`[Samsara] v2 migration failed: ${e}`)
     }
+    try {
+        migrateToUnits(player)
+    } catch (e) {
+        console.warn(`[Samsara] v3 migration failed: ${e}`)
+    }
+}
+
+// Cheap guard: one boolean read once migrated. See getStats for why it exists.
+global.SMS.ensureMigrated = player => {
+    try {
+        if (global.SMS.persistedTag(player).getBoolean(global.SMS.config.nbt.migratedV3)) return
+    } catch (ignored) {
+        return
+    }
+    global.SMS.migrateKarma(player)
 }
 
 PlayerEvents.loggedIn(event => {
@@ -324,6 +399,21 @@ global.SMS.isLiberated = player => {
 
 // ---- Rebirth routing -------------------------------------------------------
 
+// The poisons as routing JUDGES them: hatred minus its combat sub-count. Used to
+// decide which lower realm a life falls to, and whether hatred makes an asura.
+// P and Net still use the full hatred (derive), so combat counts toward the floor.
+global.SMS.judgedPoisons = stats => {
+    var hatred = Number(stats.hatred) || 0
+    var combat = Number(stats.hatredCombat) || 0
+    if (combat > hatred) combat = hatred
+    if (combat < 0) combat = 0
+    return {
+        greed: Number(stats.greed) || 0,
+        hatred: hatred - combat,
+        delusion: Number(stats.delusion) || 0,
+    }
+}
+
 // Decide which realm a player is reborn into, from stats alone.
 //
 // Returns { realm, rule } -- `rule` names the branch that matched, so the debug
@@ -346,10 +436,11 @@ global.SMS.isLiberated = player => {
 global.SMS.realmFor = stats => {
     const cfg = global.SMS.config.routing
     const d = global.SMS.derive(stats)
+    const judged = global.SMS.judgedPoisons(stats)
 
     // Rule 0. Not enough karma to judge a life by. This is what stops a new
     // player's first kill from deciding their next birth: one hostile gives
-    // P = 0.1, A = 0, net = 0.0, which would otherwise route to the animal realm.
+    // P = 1, A = 0, net = 0.0, which would otherwise route to a lower realm.
     if (d.total < cfg.minTotal) {
         return { realm: 'human', rule: `minTotal (total ${fmt(d.total)} < ${cfg.minTotal})` }
     }
@@ -369,9 +460,16 @@ global.SMS.realmFor = stats => {
         // a const inside a nested block throws "redeclaration of var" the SECOND
         // time that block runs. This has cost this project three debugging rounds --
         // see the project notes. Inside any try/if/loop body, use var.
-        var lead = global.SMS.dominantOf(stats, global.SMS.POISONS)
+        //
+        // WHICH realm is decided without combat hatred (config.hostileKillTiers): a
+        // greedy or careless life should read as greed or delusion, not as whatever
+        // the zombie count happened to be when the floor was crossed. If combat
+        // hatred is the ONLY poison, it still means hatred.
+        var judgedSum = judged.greed + judged.hatred + judged.delusion
+        var lead = judgedSum > 0 ? global.SMS.dominantOf(judged, global.SMS.POISONS) : 'hatred'
         var realm = lead === 'hatred' ? 'naraka' : lead === 'greed' ? 'preta' : 'animal'
-        return { realm: realm, rule: `lower (net ${fmt(d.net)} < ${cfg.lowerNet}, ${lead} leads)` }
+        var why = judgedSum > 0 ? `${lead} leads` : 'only combat hatred'
+        return { realm: realm, rule: `lower (net ${fmt(d.net)} < ${cfg.lowerNet}, poison ${fmt(d.P)}, ${why})` }
     }
 
     // Rule 3. Deva: real merit with no insight. Virtue without wisdom is the deva
@@ -398,22 +496,27 @@ global.SMS.realmFor = stats => {
     // under the previous rule one hatred point flipped human -> asura at a fixed
     // threshold, and no amount of merit ever bought you out. Now merit dilutes
     // hatred's share proportionally, so it does.
+    //
+    // Both gates read NON-COMBAT hatred: a gentle player who fights zombies is not
+    // "merit corrupted by aggression". Asuras are defined by rivalry and envy.
     if (d.net >= cfg.asuraNet && d.P > 0) {
-        var leadP = global.SMS.dominantOf(stats, global.SMS.POISONS)
-        if (leadP === 'hatred' && d.share.hatred >= cfg.asuraHatredShare) {
+        var leadP = global.SMS.dominantOf(judged, global.SMS.POISONS)
+        var hatredShare = d.total > 0 ? judged.hatred / d.total : 0
+        if (judged.hatred > 0 && leadP === 'hatred' && hatredShare >= cfg.asuraHatredShare) {
             return {
                 realm: 'asura',
-                rule: `asura (net ${fmt(d.net)} >= ${cfg.asuraNet}, hatred leads, share ${fmt(d.share.hatred)} >= ${cfg.asuraHatredShare})`,
+                rule: `asura (net ${fmt(d.net)} >= ${cfg.asuraNet}, non-combat hatred leads, share ${fmt(hatredShare)} >= ${cfg.asuraHatredShare})`,
             }
         }
     }
 
     // Rule 5. Everything else, including a high-net player with strong wisdom.
     //
-    // That is INTENTIONAL and canonical: the source gives human rebirth as
-    // "virtue and wisdom development", and the human realm is the only one
-    // liberation is reachable from. Landing here with high wisdom is the reward,
-    // not a failure to place.
+    // That is a DESIGN CHOICE with doctrinal support, not a canonical rule: the
+    // source lists "virtue and wisdom development" for human rebirth, but wise lay
+    // followers are also reborn as devas (Anathapindika, a stream-enterer, in Tusita:
+    // MN 143). Keeping the wise human is what keeps liberation, reachable only from
+    // the human realm, within reach.
     return { realm: 'human', rule: `human (net ${fmt(d.net)}, no other rule matched)` }
 }
 
@@ -487,57 +590,17 @@ global.SMS.forcedRealmOf = player => {
 
 global.SMS.realmOf = player => global.SMS.forcedRealmOf(player) || global.SMS.routeFor(player).realm
 
-// Does this dimension actually exist in the running game?
+// Map a realm name to a dimension id: config.realmDimensions, Samsara's own
+// dimensions. No third-party overrides (removed 2026-10-19 with those mods).
 //
-// This is what makes third-party integrations optional rather than required: an
-// override naming a dimension from an uninstalled mod simply does not resolve, and
-// Samsara falls back to its own.
-global.SMS.dimensionExists = (server, dimId) => {
-    if (!server || !dimId) return false
-    try {
-        return !!server.getLevel(dimId)
-    } catch (ignored) {
-        return false
-    }
-}
-
-// Map a realm name to a dimension id.
-//
-// Resolution order, lowest priority first:
-//   1. config.realmDimensions -- Samsara's own dimensions, always present.
-//   2. config.realmOverrides  -- third-party dimensions, applied only when they
-//      actually resolve. Later entries win, so pack authors can reorder.
-//   3. Deva tiering: Twilight Forest as the lowest heaven for a modest deva.
+// `stats` and `server` are unused now but kept so the five callers need not change;
+// tiering inside a realm will want the stats again (design doc 3 / 7.6).
 global.SMS.dimensionForRealm = (realm, stats, server) => {
     const cfg = global.SMS.config
-
     // Coerce before indexing: a Java String (or any non-primitive) would miss every
     // JS key here and silently fall back to the human dimension.
     var realmKey = realm ? '' + realm : ''
-    var chosen = cfg.realmDimensions[realmKey] || cfg.realmDimensions.human
-
-    // Third-party overrides, if allowed and actually installed.
-    if (!cfg.forceOwnDimensions && server && cfg.realmOverrides) {
-        for (let i = 0; i < cfg.realmOverrides.length; i++) {
-            var entry = cfg.realmOverrides[i]
-            if (entry.realm !== realmKey) continue
-            if (global.SMS.dimensionExists(server, entry.dimension)) {
-                chosen = entry.dimension
-            }
-        }
-    }
-
-    // Deva tiering: a barely-deva player gets the lesser heaven when it exists.
-    if (realmKey === 'deva' && stats) {
-        var tiers = cfg.devaTiers
-        if (tiers && stats.generosity < tiers.generosityThreshold) {
-            if (!cfg.forceOwnDimensions && global.SMS.dimensionExists(server, tiers.lowestHeaven)) {
-                chosen = tiers.lowestHeaven
-            }
-        }
-    }
-
-    return chosen
+    return cfg.realmDimensions[realmKey] || cfg.realmDimensions.human
 }
 
 // ---- Victim classification -------------------------------------------------
@@ -755,6 +818,7 @@ global.SMS.award = (player, act, amountOverride) => {
         console.warn(`[Samsara] unknown karma act '${act}'`)
         return null
     }
+    global.SMS.ensureMigrated(player)
     const before = global.SMS.getStat(player, stat)
     const newTotal = global.SMS.addStat(player, stat, amount)
     return { stat: stat, amount: amount, total: newTotal, capped: newTotal === before }
@@ -876,6 +940,8 @@ EntityEvents.death(event => {
 
     const r = global.SMS.award(killer, act, amount)
     if (!r) return
+    // Combat hatred: counted in hatred, ignored for asura and lower-realm choice.
+    if (act === 'killHostile') global.SMS.addCombatHatred(killer, r.amount)
     console.info(
         `[Samsara] ${killer.profile.name} killed ${victim.type} (${kind}/${act}):` +
             ` +${r.amount} ${r.stat} -> ${r.total}`
@@ -908,15 +974,58 @@ EntityEvents.hurt(event => {
 
 // ---- Greed: taking what was not given -------------------------------------
 //
-// A container the player did not place is someone else's -- a village chest, a
-// structure's loot, another player's storage. Opening it is the taking.
+// Taking what is not given needs an OWNER who did not give it. So opening a
+// container charges greed only when it belongs to someone:
+//   - another player placed it (tracked below), or
+//   - it sits in a living village (a villager within villagerBlockRadius).
+// Dungeon, ruin and structure loot belongs to no one and is free.
 //
-// Containers the player placed themselves are tracked so their own base does not
-// charge them. That set is in memory only: on a server restart a player's own
-// chests read as unknown and charge once each. Accepted deliberately -- persisting
-// a placed-block set per player would grow NBT without bound, and the 20-minute
-// window keeps the cost to a one-off trickle rather than a per-click drain.
+// Placements are tracked in memory, keyed by position, valued by the PLACER. On a
+// server restart that map is empty: a player's own chest then reads as unknown,
+// which is free unless it stands in a village. Known limit: a co-op friend's chest
+// charges greed, because shared permission is not detectable.
 const placedContainers = {}
+
+// net.minecraft.world.phys.AABB, loaded once at script load.
+//
+// getEntitiesWithin requires a real AABB (jar signature:
+// kjs$getEntitiesWithin(Lnet/minecraft/world/phys/AABB;)) and KubeJS 6 ships NO
+// AABB binding -- dev/latvian/mods/kubejs/bindings/ has BlockWrapper, ItemWrapper,
+// TextWrapper, KMath and friends, but nothing for AABB. So `AABB.of(...)` does not
+// exist and Java.loadClass is the only route.
+//
+// Loaded at load time rather than per-call: Java.loadClass is not free, and the
+// broken-block hook can fire many times a second while a player mines.
+var AABBClass = null
+try {
+    AABBClass = Java.loadClass('net.minecraft.world.phys.AABB')
+} catch (e) {
+    console.warn(`[Samsara] could not load AABB; village-block greed is disabled: ${e}`)
+}
+
+// Is a villager-class being within villagerBlockRadius of x/y/z?
+// Returns null when it cannot tell, so callers can decline to charge on a guess.
+//
+// BlockContainerJS has NO collision API and no bounding box -- verified in the jar.
+// The search box is built from the block's own x/y/z with the 6-double AABB
+// constructor. getEntitiesWithin returns a Java List (EntityArrayList), not a JS
+// array: Java 21's getFirst() is NOT available on it under Rhino, so size()/get(i).
+function villagerNear(level, x, y, z) {
+    if (!AABBClass || !level) return null
+    const cfg = global.SMS.config
+    try {
+        var rad = cfg.villagerBlockRadius
+        var box = new AABBClass(x - rad, y - rad, z - rad, x + rad + 1, y + rad + 1, z + rad + 1)
+        var near = level.getEntitiesWithin(box)
+        for (var i = 0; i < near.size(); i++) {
+            if (cfg.villagerLikeEntities.indexOf('' + near.get(i).type) !== -1) return true
+        }
+        return false
+    } catch (e) {
+        console.warn(`[Samsara] villager-proximity check failed: ${e}`)
+        return null
+    }
+}
 
 // Position key for a BlockContainerJS.
 //
@@ -949,7 +1058,7 @@ BlockEvents.placed(event => {
         }
         if (!isContainer) return
         var key = containerPosKey(event.block)
-        if (key) placedContainers[key] = true
+        if (key) placedContainers[key] = playerKey(placer)
     } catch (ignored) {
         // cannot read the block; nothing to record
     }
@@ -964,8 +1073,9 @@ PlayerEvents.chestOpened(event => {
     if (!player) return
 
     var posKey = null
+    var block = null
     try {
-        var block = event.block
+        block = event.block
         if (!block) return
         posKey = containerPosKey(block)
     } catch (ignored) {
@@ -975,33 +1085,31 @@ PlayerEvents.chestOpened(event => {
     }
     if (!posKey) return
 
-    // Their own container.
-    if (placedContainers[posKey]) return
+    // Whose is it?
+    var placer = placedContainers[posKey]
+    if (placer === playerKey(player)) return // their own
+    var owner = null
+    if (placer) {
+        owner = 'another player'
+    } else {
+        // Jar-verified: BlockContainerJS.getLevel().
+        var village = null
+        try {
+            village = villagerNear(block.level, block.x, block.y, block.z)
+        } catch (ignored) {
+            village = null
+        }
+        if (village === true) owner = 'a village'
+    }
+    if (!owner) return // ownerless loot, or proximity unknown: nothing was stolen
 
     const cfg = global.SMS.config.karmaAntiFarm
     if (alreadyPaid(player, 'container', posKey, cfg.containerPositionTicks, cfg.containerMemoryMax)) return
 
     const r = global.SMS.award(player, 'lootContainer')
     if (!r) return
-    console.info(`[Samsara] ${player.profile.name} opened a container they did not place: +${r.amount} ${r.stat} -> ${r.total}`)
+    console.info(`[Samsara] ${player.profile.name} opened ${owner}'s container: +${r.amount} ${r.stat} -> ${r.total}`)
 })
-
-// net.minecraft.world.phys.AABB, loaded once at script load.
-//
-// getEntitiesWithin requires a real AABB (jar signature:
-// kjs$getEntitiesWithin(Lnet/minecraft/world/phys/AABB;)) and KubeJS 6 ships NO
-// AABB binding -- dev/latvian/mods/kubejs/bindings/ has BlockWrapper, ItemWrapper,
-// TextWrapper, KMath and friends, but nothing for AABB. So `AABB.of(...)` does not
-// exist and Java.loadClass is the only route.
-//
-// Loaded at load time rather than per-call: Java.loadClass is not free, and the
-// broken-block hook can fire many times a second while a player mines.
-var AABBClass = null
-try {
-    AABBClass = Java.loadClass('net.minecraft.world.phys.AABB')
-} catch (e) {
-    console.warn(`[Samsara] could not load AABB; village-block greed is disabled: ${e}`)
-}
 
 // Destroying a village's infrastructure. Charged only when a villager is actually
 // nearby, so dismantling an abandoned structure is free.
@@ -1018,42 +1126,15 @@ BlockEvents.broken(event => {
     }
     if (cfg.villagerBlocks.indexOf(id) === -1) return
 
-    if (!AABBClass) return
-
-    // Is a villager watching?
-    //
-    // BlockContainerJS has NO collision API and no bounding box -- verified in the
-    // jar, and noted in the project notes. The search box is therefore built from the
-    // block's own x/y/z, which it DOES expose (getX/getY/getZ, confirmed in the
-    // jar), using the 6-double AABB constructor.
-    //
-    // getEntitiesWithin returns a Java List (EntityArrayList), not a JS array:
-    // Java 21's getFirst() is NOT available on it under Rhino, so use size()/get(i).
-    var villagerNear = false
+    // Is a villager watching? null (cannot tell) is treated as no: never charge on
+    // a guess.
+    var watched = null
     try {
-        // NOT named `r`: the award result below is `const r`, and Rhino scopes
-        // const per FUNCTION, so a `var r` anywhere in this handler collides with
-        // it. Node caught this as "Identifier 'r' has already been declared";
-        // in Rhino it would have been a runtime "redeclaration of var".
-        var rad = cfg.villagerBlockRadius
-        var bx = event.block.x
-        var by = event.block.y
-        var bz = event.block.z
-        var box = new AABBClass(bx - rad, by - rad, bz - rad, bx + rad + 1, by + rad + 1, bz + rad + 1)
-        var near = event.level.getEntitiesWithin(box)
-        for (var i = 0; i < near.size(); i++) {
-            var e = near.get(i)
-            if (cfg.villagerLikeEntities.indexOf('' + e.type) !== -1) {
-                villagerNear = true
-                break
-            }
-        }
-    } catch (e2) {
-        // Cannot determine proximity: do not charge on a guess.
-        console.warn(`[Samsara] villager-proximity check failed: ${e2}`)
-        return
+        watched = villagerNear(event.level, event.block.x, event.block.y, event.block.z)
+    } catch (ignored) {
+        watched = null
     }
-    if (!villagerNear) return
+    if (watched !== true) return
 
     const r = global.SMS.award(breaker, 'breakVillagerBlock')
     if (!r) return
@@ -1061,6 +1142,32 @@ BlockEvents.broken(event => {
 })
 
 // ---- Generosity: feeding animals -------------------------------------------
+
+// Per-player feeding budget: at most feedPerPlayerMax paid feedings in any
+// feedPerPlayerWindowTicks, across all animals. In memory; a restart forgives it.
+global.SMS.feedLog = global.SMS.feedLog || {}
+
+function feedRecent(player) {
+    const farm = global.SMS.config.karmaAntiFarm
+    const now = global.SMS.tickClock || 0
+    const key = playerKey(player)
+    var log = global.SMS.feedLog[key] || []
+    var kept = []
+    for (var i = 0; i < log.length; i++) {
+        var age = now - log[i]
+        if (age >= 0 && age < farm.feedPerPlayerWindowTicks) kept.push(log[i])
+    }
+    global.SMS.feedLog[key] = kept
+    return kept
+}
+
+function feedRateOk(player) {
+    return feedRecent(player).length < global.SMS.config.karmaAntiFarm.feedPerPlayerMax
+}
+
+function feedRateRecord(player) {
+    feedRecent(player).push(global.SMS.tickClock || 0)
+}
 //
 // Feeding is GIVING. AN 3.57: even throwing the rinsings of a bowl into a pool for
 // the creatures living there "would be a source of merit".
@@ -1141,8 +1248,13 @@ ItemEvents.entityInteracted(event => {
     }
     if (!isFood) return
 
-    // Once per animal per window, or a stack of wheat is a merit vending machine.
+    // Per PLAYER rate limit first (a pen of animals is otherwise a vending machine),
+    // and it must come BEFORE alreadyPaid: that records a payment whenever it
+    // returns false, so checking it first would mark an animal paid that never was.
+    if (!feedRateOk(player)) return
+    // Once per animal per window.
     if (alreadyPaid(player, 'feed', id, farm.feedEntityTicks, farm.entityMemoryMax)) return
+    feedRateRecord(player)
 
     const r = global.SMS.award(player, 'feedAnimal')
     if (!r) return

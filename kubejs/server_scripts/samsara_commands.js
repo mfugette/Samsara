@@ -108,6 +108,18 @@ ServerEvents.commandRegistry(event => {
             pairRow(pz, global.SMS.ANTIDOTE_FOR[pz])
         }
 
+        // The combat part of hatred. Routing treats it differently (it counts toward
+        // P, but not toward asura or which lower realm), so a verdict that looks
+        // wrong from the hatred number alone is explained here.
+        if (stats.hatredCombat > 0) {
+            reply(
+                ctx,
+                Text.darkGray(
+                    `  (of hatred, ${n2(stats.hatredCombat)} is combat: counts toward P, not toward asura or which lower realm)`
+                )
+            )
+        }
+
         // Derived values. These are what every routing rule reads.
         //
         // Net is shown as an em dash when there is no karma at all. The ROUTING value
@@ -193,9 +205,9 @@ ServerEvents.commandRegistry(event => {
     // Shared builder for set/add, which differ only in how the new value combines
     // with the old one.
     //
-    // Value is a DOUBLE, not an integer: the whole scale is 0..10 in 0.05 steps, so
-    // an integer argument type would make every stat unsettable except at whole
-    // numbers and `/karma set x wisdom 0.4` would be rejected.
+    // Value is a DOUBLE, in UNITS (one unit = striking an animal once; feeding is
+    // 0.5), so fractional values must be accepted. Admin writes bypass the
+    // award-side rules (tiers, rate limits) on purpose -- they are for testing.
     const mutator = (name, apply) =>
         C.literal(name)
             .requires(source => source.hasPermission(2))
@@ -220,8 +232,9 @@ ServerEvents.commandRegistry(event => {
                             return reply(
                                 ctx,
                                 Text.green(
-                                    `${target.profile.name}'s ${stat} is now ${n2(total)}` +
-                                        ` (cap ${global.SMS.config.statCap}, grain ${global.SMS.config.statGrain})`
+                                    `${target.profile.name}'s ${stat} is now ${n2(total)} units` +
+                                        ` (thresholds: judged from ${global.SMS.config.routing.minTotal} total,` +
+                                        ` lower birth from ${global.SMS.config.routing.lowerMinPoison} poison)`
                                 )
                             )
                         }))))
@@ -351,11 +364,12 @@ ServerEvents.commandRegistry(event => {
                         const nbt = global.SMS.config.nbt
                         const tag = global.SMS.persistedTag(target)
 
-                        // 1. The six stats and the per-life counters (hostile-kill
-                        //    tiers, endurance cap).
+                        // 1. The six stats, the combat sub-count, and the per-life
+                        //    counters (hostile-kill tiers, endurance cap).
                         for (var i = 0; i < global.SMS.STATS.length; i++) {
                             global.SMS.setStat(target, global.SMS.STATS[i], 0)
                         }
+                        tag.putDouble(nbt.hatredCombat, 0)
                         global.SMS.resetLifeCounters(target)
 
                         // 2. Testing overrides and the liberation flag.
@@ -376,6 +390,7 @@ ServerEvents.commandRegistry(event => {
                         tag.putDouble(nbt.legacyMeditation, 0)
                         tag.putBoolean(nbt.migrated, true)
                         tag.putBoolean(nbt.migratedV2, true)
+                        tag.putBoolean(nbt.migratedV3, true)
 
                         // 5. Back to a human birth, and strip the old realm's effects.
                         tag.putString(nbt.birthRealm, 'human')

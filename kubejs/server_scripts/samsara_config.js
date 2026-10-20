@@ -29,56 +29,72 @@ global.SMS.ANTIDOTE_FOR = {
 }
 
 global.SMS.config = {
-    // ---- Scale --------------------------------------------------------------
-    // Every stat lives in 0 .. statCap. Small numbers are deliberate: the player
-    // reads these in Yama's ledger, and a 0-10 scale is legible at a glance where
-    // an unbounded accumulator is not.
-    statCap: 10.0,
-
-    // All stat writes are rounded to a multiple of this. Award values are drawn
-    // from {0.1, 0.25, 0.5, 0.75, 1.0}, whose finest common grain is 0.05, so
-    // quantising here means a stat can never carry a trailing decimal beyond two
-    // places. This is enforced in ONE place (global.SMS.setStat) so nothing can
-    // bypass it -- ripening produces values like 1.125 or 2.4750000000000001
-    // otherwise.
+    // ---- Scale (units, redesigned 2026-10-19) ------------------------------
+    // ONE UNIT = striking an animal once: the smallest unwholesome act. Every value
+    // below is a multiple of that, so the table reads as "how many small wrongs is
+    // this worth".
     //
-    // CONSEQUENCE: any CHANGE smaller than half a grain (0.025) is rounded away. A
-    // multiplicative step on a small stat can therefore be a silent no-op -- this is
-    // what killed passive decay (1% of anything under 2.5 rounded straight back), see
-    // samsara_decay.js. Every award below is a whole number of grains for this reason.
-    statGrain: 0.05,
+    // Stats are stored EXACTLY. There is no grain and no cap at 10 any more:
+    //   - The old 0.05 grain rounded any change under 0.025 away. That silently killed
+    //     passive decay and would have eaten any proportional mechanic after it.
+    //   - The old cap at 10 made the eleventh villager murder free, and made ten
+    //     murders look the same as a hundred. Dhp 121-122: "drop by drop is the water
+    //     pot filled" -- of evil and of good alike. Every deed counts.
+    // Routing reads SHARES, so the absolute scale does not decide realms; the
+    // thresholds in config.routing (minTotal, lowerMinPoison) are what do.
+    //
+    // statCap is only an OVERFLOW ceiling, far above anything play reaches.
+    statCap: 10000,
 
-    // ---- Karma point values -------------------------------------------------
+    // Writes are rounded to this, purely to strip float noise (0.1 + 0.2 =
+    // 0.30000000000000004) so a stat cannot sit at 59.9999999 under a threshold of
+    // 60. It is a million times finer than the smallest award, so unlike the old
+    // grain it can never swallow a real change.
+    storePrecision: 0.000001,
+
+    // ---- Karma point values (units) ----------------------------------------
     // Each entry says: this act adds this much to this stat. Values are additive
     // and positive -- a "bad" act grows a poison, it does not shrink an antidote.
     //
-    // Scaled for statCap = 10: killVillager at 1.0 means ten villagers cap hatred.
-    // Hostile kills are capped per life instead (hostileKillTiers). Every value is from the agreed
-    // increment set {0.1, 0.25, 0.5, 0.75, 1.0}.
+    // ANTIDOTES ARE WORTH LESS PER ACT, and have fewer sources. Dhp 163: "Easy to do
+    // are things that are bad and harmful to oneself. But exceedingly difficult to do
+    // are things that are good and beneficial."
     karma: {
         // --- Hatred: harming living things ---
-        // Hostiles are cheapest -- combat is normal play here. This is the FULL
-        // rate; it falls off within a life per hostileKillTiers below.
-        killHostile: 0.1,
-        killPassive: 0.25, // animals and other peaceful mobs
-        killVillager: 1.0, // villager-class: the heaviest single act in the game
-        killTamed: 1.0, // a tamed or named animal: betrayal of a bond
-        killBaby: 0.5, // a baby animal
-        hurtPassive: 0.1, // struck a peaceful mob and left it alive
+        // A HOSTILE kill is the full rate here, then falls off within a life per
+        // hostileKillTiers below, and is tracked as COMBAT hatred (see that block).
+        killHostile: 1,
+        hurtPassive: 1, // struck a peaceful being and left it alive: THE unit
+        killPassive: 3, // animals and other peaceful mobs
+        killBaby: 5, // a baby animal
+        killTamed: 10, // a tamed or named animal: betrayal of a bond
+        // Villager-class: the gravest act in the game. Killing a human being is the
+        // heaviest kind of killing in both the suttas and the Vinaya (a defeat-offence,
+        // where killing an animal is a lesser one), so it is ~8x a passive kill.
+        killVillager: 25,
 
         // --- Greed: taking what was not given ---
-        lootContainer: 0.1, // opened a container the player did not place
-        breakVillagerBlock: 0.25, // destroyed a villager's workstation or bed
+        // Only from an OWNER: a village container, or one another player placed.
+        // Dungeon and structure loot belongs to no one -- taking what is not given
+        // needs someone who did not give it. See PlayerEvents.chestOpened.
+        lootContainer: 1,
+        breakVillagerBlock: 3, // destroyed a villager workstation or bed
 
         // --- Delusion: heedlessness (moha) ---
-        carelessDeath: 0.25, // died with nobody to blame -- fall, lava, drowning
-        repeatDeath: 0.5, // died again inside the rapid-death window
+        // Deaths are the ONLY delusion source today, and each death also ripens 20%
+        // of everything -- measured, delusion alone plateaus around 12 and can never
+        // reach lowerMinPoison, so the ANIMAL REALM IS EFFECTIVELY GATED until a
+        // non-death source exists. Planned: intoxicants (the fifth precept;
+        // heedlessness, Dhp 21) as a delusion source, added by this mod later.
+        carelessDeath: 2, // died with nobody to blame -- fall, lava, drowning
+        repeatDeath: 5, // died again inside the rapid-death window
 
         // --- Generosity (dana) ---
         // Feeding an animal is GIVING. AN 3.57: even throwing the rinsings of a bowl
-        // into a pool for the creatures there "would be a source of merit". It was
-        // filed under metta before; the sutta files it under dana.
-        feedAnimal: 0.1,
+        // into a pool for the creatures there "would be a source of merit". Rate
+        // limited per player (karmaAntiFarm.feedPerPlayer*), or a pen is a vending
+        // machine.
+        feedAnimal: 0.5,
 
         // --- Metta: non-hatred (adosa) ---
         // Metta comes from two sources only: meditation (phase 6, not built) and
@@ -93,7 +109,7 @@ global.SMS.config = {
         // pet, and breeding is husbandry, not giving -- and its proxy paid for any
         // baby that spawned near anyone. Retired 2026-10-19; the code is in git
         // history (the first commit) if any of them comes back.
-        enduredEncounter: 0.25,
+        enduredEncounter: 2,
 
         // --- Wisdom (panna) ---
         // DELIBERATELY EMPTY. Wisdom comes from insight: the Four Sights, realm
@@ -106,11 +122,9 @@ global.SMS.config = {
     // Which stat each act feeds. Keeping this separate from the numbers means
     // re-routing an act to a different stat is a one-word edit.
     //
-    // NOTE on metta vs. the old `virtue`: metta is loving-kindness, so it covers
-    // acts directed AT a living being (feeding, taming, tending). General ethical
-    // conduct -- honest trades, not stealing -- is handled as the ABSENCE of greed
-    // rather than as a metta award. There is no act here that pays for merely
-    // refraining.
+    // NOTE: metta is non-hatred, earned only by non-retaliation (and later
+    // meditation). General ethical conduct -- honest trades, not stealing -- is
+    // handled as the ABSENCE of greed rather than as an award.
     karmaStat: {
         killHostile: 'hatred',
         killPassive: 'hatred',
@@ -130,26 +144,35 @@ global.SMS.config = {
         enduredEncounter: 'metta',
     },
 
-    // ---- Hostile kills fall off within a life -------------------------------
-    // Without passive decay, every hostile kill is permanent until it ripens. At a
-    // flat 0.1, twenty zombies took a fresh player to total 2.0 = minTotal with no
-    // antidotes, i.e. Net 0 -> NARAKA after one ordinary night (measured 2026-10-19).
+    // ---- Hostile kills: tiered per life, and tracked as COMBAT hatred ---------
+    // Each tier pays `value` per kill until the hostile-kill count THIS LIFE reaches
+    // `upTo`; past the last tier a hostile kill adds nothing. The counter resets at
+    // death (global.SMS.resetLifeCounters). Per-life max here:
+    // 10 x 1 + 10 x 0.5 + 10 x 0.25 = 17.5.
     //
-    // Each tier pays `value` per kill until the player's hostile-kill count THIS LIFE
-    // reaches `upTo`; past the last tier a hostile kill adds nothing. The counter
-    // resets at death (global.SMS.resetLifeCounters).
+    // Doctrine: killing a hostile is REAL killing -- the first precept has no
+    // exception for dangerous beings, and fear-driven killing is still rooted in
+    // aversion (AN 6.63: intention is kamma). But it is LIGHT: the commentaries grade
+    // killing by the victim and the mind behind it, and a being that attacks you,
+    // killed under threat, weighs far less than a virtuous one killed in cruelty.
+    // And light deeds still add up (Dhp 121). So a life of nothing but combat tips
+    // downward EVENTUALLY: dying about once an hour, combat hatred settles near
+    // 17.5 / 0.2 = ~70, deliberately clear of lowerMinPoison (60) rather than on it.
+    // The harness pins this: a pure fighter falls after several violent lives, and
+    // one who also does modest good stays human.
     //
-    // The per-life total MUST stay below routing.minTotal, or hostiles alone send a
-    // pure-combat player down on their first life. Here: 10 x 0.1 + 10 x 0.05 = 1.5.
-    // The harness checks that invariant.
-    //
-    // A GAME CONCESSION, not doctrine. The first precept makes no exception for
-    // hostile beings. The world forces combat on the player; this keeps that from
-    // being the whole verdict, while killing passives and villagers stays full price.
-    // Values must be whole grains (statGrain) or they round to nothing.
+    // COMBAT HATRED (the sub-count samsara_hatred_combat) is the part of hatred that
+    // came from hostile kills. It counts toward P and toward naraka like any hatred,
+    // but routing IGNORES it when deciding (a) whether hatred leads for ASURA and
+    // (b) WHICH lower realm a poison-led life falls to. Otherwise a gentle player who
+    // fights zombies read as "merit corrupted by aggression" (asura), and a greedy or
+    // careless player's realm depended on when the floor was crossed rather than on
+    // the life. If combat hatred is the ONLY poison, it still means hatred -> naraka.
+    // Asuras are defined by rivalry and envy, not by fending off attackers.
     hostileKillTiers: [
-        { upTo: 10, value: 0.1 },
-        { upTo: 20, value: 0.05 },
+        { upTo: 10, value: 1 },
+        { upTo: 20, value: 0.5 },
+        { upTo: 30, value: 0.25 },
     ],
 
     // ---- Endurance: metta from non-retaliation ------------------------------
@@ -183,17 +206,17 @@ global.SMS.config = {
         // At most one award per this window. 6000 = 5 min.
         awardWindowTicks: 6000,
 
-        // AGGREGATE bound: metta from endurance per life never exceeds this.
-        // Resets at death, so it bounds a life, not the whole save -- see
-        // blockRapidDeath for what stops dying from becoming the reset button.
-        perLifeMax: 1.0,
+        // AGGREGATE bound: metta from endurance per life never exceeds this (four
+        // encounters). Resets at death, so it bounds a life, not the whole save --
+        // see blockRapidDeath for what stops dying from becoming the reset button.
+        perLifeMax: 8,
 
         // An encounter that ends in DEATH pays only if the previous death was at
         // least ripening.cooldownTicks ago. Mob deaths add no delusion (there is an
         // attacker), and each death resets perLifeMax, so without this a player could
         // let a zombie kill them every few minutes for unbounded metta. With it, a
         // death farm pays at most once per cooldown and each death ripens 20% of
-        // metta, so it converges (to ~1.0) instead of climbing. Harness-measured.
+        // metta, so it converges (to ~8) instead of climbing. Harness-measured.
         blockRapidDeath: true,
     },
 
@@ -213,20 +236,19 @@ global.SMS.config = {
     //
     //   0. minTotal floor   -> human   (not enough karma to judge)
     //   1. liberation       -> no rebirth at all (see config.liberation)
-    //   2. Net < lowerNet   -> down; the largest poison picks the realm
+    //   2. Net < lowerNet AND P >= lowerMinPoison
+    //                       -> down; the largest NON-COMBAT poison picks the realm
     //   3. Net >= devaNet AND wisdom share of A < devaWisdomMax -> deva
-    //   4. Net >= asuraNet AND hatred leads P AND hatred share >= asuraHatredShare
-    //                       -> asura
+    //   4. Net >= asuraNet AND non-combat hatred leads P AND its share
+    //      >= asuraHatredShare -> asura
     //   5. otherwise        -> human
     routing: {
         // Rule 0. Below this much total karma (A + P), routing always returns human.
         //
         // This is what stops a brand-new player's FIRST kill from deciding their
-        // next life. One hostile gives P = 0.1, A = 0, so Net = 0.0, which is below
-        // lowerNet and would otherwise route straight to the animal realm. The floor
-        // is the direct successor to the old `neutralBand`, expressed on the new
-        // scale.
-        minTotal: 2.0,
+        // next life. One hostile gives P = 1, A = 0, so Net = 0.0, which is below
+        // lowerNet. 20 units = about twenty small acts before a life is judged.
+        minTotal: 20,
 
         // Rule 2. Below this Net, the player falls. 0.40 means poison must outweigh
         // antidote by roughly 3:2 before a lower rebirth happens.
@@ -238,7 +260,11 @@ global.SMS.config = {
         // is the weight a life must carry before it tips downward -- AN 3.99's salt
         // crystal: a little evil does not ruin a whole river. Below it, a poison-led
         // life is still human (rules 3/4 cannot match at Net < 0.40).
-        lowerMinPoison: 6.0,
+        //
+        // 60 units: about sixty small wrongs, or two villagers and some more.
+        // Measured: an ordinary player (fights, kills a few animals for food, feeds a
+        // few) first falls at ~4 h -- the agreed target. The harness pins it.
+        lowerMinPoison: 60,
 
         // Rule 3. Deva: real merit, but no insight. Virtue without wisdom is the
         // classic deva trap -- a pleasant birth that burns through its own merit.
@@ -347,8 +373,8 @@ global.SMS.config = {
         repeatFalloff: 0.35,
 
         // Values at or below this after ripening are zeroed, so stats actually reach
-        // 0. One statGrain step. (Moved here from the retired `decay` block.)
-        floor: 0.05,
+        // 0 instead of trailing fractions forever. Half a unit.
+        floor: 0.5,
     },
 
     // ---- Realm -> dimension mapping -----------------------------------------
@@ -374,36 +400,10 @@ global.SMS.config = {
         brahma: 'samsara:brahma', // jhana only -- see note above
     },
 
-    // ---- Optional third-party integrations ----------------------------------
-    // If a pack ships a mod with a better-suited dimension, prefer it. Each entry is
-    // only applied when that dimension actually resolves at runtime, so an uninstalled
-    // mod costs nothing and nothing here is a hard dependency.
-    //
-    // Pack authors: add, remove or reorder freely. Later entries win.
-    realmOverrides: [
-        { realm: 'deva', dimension: 'aether:the_aether' },
-        { realm: 'preta', dimension: 'undergarden:undergarden' },
-        // NOTE: deliberately commented out. minecraft:the_end always resolves, so
-        // this would ALWAYS win over samsara:asura and the custom realm would never
-        // be seen. Uncomment only in a pack with an End overhaul worth preferring.
-        // { realm: 'asura', dimension: 'minecraft:the_end' },
-    ],
-
-    // Set true to ignore realmOverrides entirely and always use Samsara's own
-    // dimensions, even when the other mods are present.
-    forceOwnDimensions: false,
-
-    // Deva is tiered: the source puts six heavens in the sense-sphere. When Twilight
-    // Forest is present it serves as the LOWEST heaven (Four Great Kings -- yakkhas
-    // and tree spirits, which the source compares to goblins and fairies), so a
-    // player who is barely a deva lands there rather than in the heaven proper.
-    // Falls back silently to the realm's normal dimension when absent.
-    //
-    // Threshold is on the 0..statCap scale now, not the old unbounded one.
-    devaTiers: {
-        lowestHeaven: 'twilightforest:twilight_forest',
-        generosityThreshold: 5.0,
-    },
+    // No third-party dimensions. The Aether / Undergarden overrides and the Twilight
+    // Forest "lowest heaven" tier were removed 2026-10-19 along with those mods:
+    // Samsara uses only the dimensions above. The lowest heaven moves into the
+    // Overworld as presences (design doc 7.6).
 
     // ---- Realm penalties ----------------------------------------------------
     // CRITICAL RULE: penalties follow the player's birthRealm, NEVER the dimension
@@ -544,6 +544,13 @@ global.SMS.config = {
         // Cap on remembered container positions per player before pruning. Keeps the
         // in-memory map bounded over a long session.
         containerMemoryMax: 512,
+
+        // Feeding pays at most feedPerPlayerMax times per feedPerPlayerWindowTicks,
+        // across ALL animals. The per-animal window below alone let a pen of twenty
+        // animals pay every five minutes -- 120 units an hour. With this, the most
+        // feeding can ever earn is 4 x 0.5 per 20 min = 6 units an hour.
+        feedPerPlayerMax: 4,
+        feedPerPlayerWindowTicks: 24000,
 
         // Hitting the same mob repeatedly pays hatred once per this window.
         // 1200 ticks = 1 real minute. Without it, hurtPassive would charge per swing
@@ -952,6 +959,13 @@ global.SMS.config = {
         // Per-LIFE counters, zeroed at death by global.SMS.resetLifeCounters.
         lifeHostileKills: 'samsara_life_hostile_kills', // drives hostileKillTiers
         lifeEndured: 'samsara_life_endured', // metta paid by endurance this life
+
+        // The part of hatred that came from hostile kills (see hostileKillTiers).
+        // Kept <= hatred: ripening scales it with hatred, and reads clamp it.
+        hatredCombat: 'samsara_hatred_combat',
+
+        // v3: the 0..10 / 0.05-grain scale -> exact units (x10).
+        migratedV3: 'samsara_migrated_v3',
 
         // Liberation: set once the player passes the check. Skips rebirth entirely.
         liberated: 'samsara_liberated',
