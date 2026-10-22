@@ -397,7 +397,12 @@ global.SMS.config = {
         naraka: 'samsara:naraka',
         preta: 'samsara:preta',
         animal: 'minecraft:overworld', // the animal realm shares the human world
-        asura: 'samsara:asura',
+        // Asuras live at the foot of Mount Sineru (Ja 31: cast down from Tavatimsa to
+        // "the lowest level of Mount Sineru"), so they are born in its dimension -- the
+        // endless sea, with the mountain at 0,0 (gen_sineru.js; design doc 7.11).
+        // samsara:asura still EXISTS, unrouted: removing a dimension from the datapack
+        // can stop older saves that have it from loading.
+        asura: 'samsara:sineru',
         human: 'minecraft:overworld',
         deva: 'samsara:deva',
         brahma: 'samsara:brahma', // jhana only -- see note above
@@ -651,7 +656,7 @@ global.SMS.config = {
     // landed in game on 2026-10-18:
     //
     //   realm   gradient         density=0   observed landing
-    //   asura   y -64..96        y~34        25
+    //   asura   (none: Mount Sineru's first alinda, y 71, a generated template)
     //   preta   y 0..12          y~11         9
     //   naraka  y 0..24          y~18        18
     //   deva    y 72..100        y~94       138   (noise lifts the islands well above)
@@ -663,7 +668,10 @@ global.SMS.config = {
         animal: { x: 0, y: 72, z: 0 }, // shares the human world
         naraka: { x: 0, y: 18, z: 0 }, // cavern floor
         preta: { x: 0, y: 11, z: 0 }, // shallow caves under a ceiling
-        asura: { x: 0, y: 34, z: 0 }, // plateaus
+        // The foot of Mount Sineru: on the first alinda at the head of the south entrance
+        // stair, which climbs out of the sea. MUST be standable on the generated
+        // template (harness 20 checks it): the alinda's top block is y 71.
+        asura: { x: 0, y: 72, z: 118 },
         deva: { x: 0, y: 136, z: 0 }, // floating islands (noise sits above the crossing)
         // Sparse platforms. 150, not 156: brahma's lower gradient peaks at y=148 and
         // its upper gradient starts subtracting at y=160, so the densest band is
@@ -693,14 +701,14 @@ global.SMS.config = {
     // Verified against kubejs/data/samsara/dimension_type/*.json:
     //   naraka  min_y 0,   height 128  -> 0..128
     //   preta   min_y 0,   height 128  -> 0..128
-    //   asura   min_y -64, height 320  -> -64..256
+    //   asura   samsara:sineru, min_y -64, height 704 -> -64..640
     //   deva    min_y 0,   height 256  -> 0..256
     //   brahma  min_y 0,   height 256  -> 0..256
     //   overworld (human/animal)       -> -64..320
     realmScanBounds: {
         naraka: { min: 1, max: 127 },
         preta: { min: 1, max: 127 },
-        asura: { min: -63, max: 255 },
+        asura: { min: -63, max: 639 },
         deva: { min: 1, max: 255 },
         brahma: { min: 1, max: 255 },
         human: { min: -63, max: 319 },
@@ -725,7 +733,8 @@ global.SMS.config = {
         //   brahma  peak +0.15 vs +/-1.1  -> needs noise > -0.14: a MINORITY of
         //                                    columns. Sparse platforms, by design.
         //   deva    peak +0.5  vs +/-1.2  -> needs noise > -0.42: most columns.
-        //   asura   dense below ~y=60                 -> ordinary terrain.
+        //   asura   Mount Sineru's terraces in an open sea -> the default radius
+        //           finds the first alinda around its anchor.
         //   human/animal                              -> vanilla overworld.
         //   naraka/preta  cavern, solid by default    -> ordinary.
         //
@@ -900,7 +909,7 @@ global.SMS.config = {
         minSurfaceY: {
             human: 50,
             animal: 50,
-            asura: 20,
+            asura: 64, // above the sea: in the Sineru dimension only the mountain is ground
             deva: 80,
             brahma: 100,
             default: 50,

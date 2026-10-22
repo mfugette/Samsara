@@ -1,0 +1,11 @@
+{
+  "type": "samsara:sineru",
+  "generator": {
+    "type": "minecraft:noise",
+    "settings": "samsara:sineru",
+    "biome_source": {
+      "type": "minecraft:fixed",
+      "biome": "samsara:sineru"
+    }
+  }
+}
