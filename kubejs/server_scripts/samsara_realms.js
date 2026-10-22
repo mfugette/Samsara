@@ -1,4 +1,11 @@
+// priority: 60
 // Samsara — realm penalties.
+//
+// PRIORITY 60, above samsara_karma.js (50) and samsara_rebirth.js (40): an EXITING
+// handler stops the handlers after it, so the animal-realm placement refusal below
+// must run before karma's container-ownership recorder (a refused placement must not
+// be recorded), and this file's respawn safety net registers before rebirth's
+// respawn handler. KubeJS 7 orders files by `// priority: N` (higher first), then path.
 //
 // CRITICAL RULE: penalties follow the player's `birthRealm`, NEVER the dimension they
 // are standing in. Players still need the Nether (blaze rods, netherite) and the End
@@ -7,7 +14,13 @@
 // See design doc section 7.
 //
 // Effects are declared in config.realmEffects. Realms with no entry have no penalties
-// yet -- preta, asura, deva and brahma all need mods that are not installed.
+// yet (asura, deva, brahma: a design question, not built).
+//
+// CANCELLING ON KUBEJS 7 (and 6 -- read from both jars): event.cancel() THROWS an
+// EventExit, so nothing after it in the handler runs, and a try/catch around it CATCHES
+// the exit and silently un-cancels the event. So every refusal here sends its message
+// FIRST and calls cancel() LAST, outside any try. cancel() and cancel(false) are the
+// same result (INTERRUPT_FALSE).
 
 global.SMS = global.SMS || {}
 
@@ -47,19 +60,19 @@ const VANILLA_MAX_HEALTH = 20.0
 
 // Read the current max health.
 //
-// `player.maxHealth` and `player.health` are NOT readable: LivingEntityMixin carries
-// no @RemapForJS for getMaxHealth / getHealth / setHealth (verified by dumping the
-// mixin). Only kjs$setMaxHealth exists for writing. The original code gated on
-// `if (player.maxHealth !== target)`, which threw and dropped the whole body into its
-// catch -- so realm health penalties never applied at all.
+// FIRST the attribute's base value, which is exactly what setMaxHealth writes. On
+// 1.20.1 Rhino coerced the registry-id string into an Attribute (confirmed in game
+// 2026-10-18: before=20, before=14). On KubeJS 7 the parameter is a
+// Holder<Attribute>, and whether a string coerces into that is unverified.
 //
-// kjs$getAttributeBaseValue's signature takes a net.minecraft Attribute OBJECT
-// (`(Lnet/.../Attribute;)D` in LivingEntityKJS), but Rhino DOES coerce the registry-id
-// string into one -- confirmed in game on 2026-10-18, where this returned real values
-// (before=20, before=14) rather than throwing.
+// THEN vanilla getMaxHealth(), callable by its Mojang name on 1.21.1 (it was an
+// unreachable SRG name on 1.20.1, where `player.maxHealth` threw and once disabled
+// the penalty outright). It is the TOTAL value (base + modifiers), not the base --
+// fine for the "does it differ" test and the log, since setMaxHealth is idempotent.
 //
 // Returns null when unreadable, which callers must treat as "set it anyway" rather
 // than "skip": the whole point is that a missing getter must not disable the penalty.
+
 // How often the preta clamp runs. 4 ticks = 5x/second: frequent enough that a meal
 // cannot visibly push the bar past the cap, cheap enough to ignore (it is a numeric
 // compare per online player, and it early-returns on realms with no foodCap).
@@ -76,7 +89,13 @@ function readMaxHealth(player) {
         var v = Number(player.getAttributeBaseValue('minecraft:generic.max_health'))
         if (isFinite(v) && v > 0) return v
     } catch (ignored) {
-        // attribute API unavailable for this entity
+        // no string -> Holder coercion; try the vanilla getter
+    }
+    try {
+        var t = Number(player.getMaxHealth())
+        if (isFinite(t) && t > 0) return t
+    } catch (ignored2) {
+        // neither readable
     }
     return null
 }
@@ -94,27 +113,19 @@ function readMaxHealth(player) {
 // effect that writes something persistent MUST be undone here, not just skipped while
 // the new realm is active.
 //
-// Registry of what is stored vs live, as of 2026-10-18:
-//   maxHealth       STORED attribute        -> reset below (to the new realm's value)
-//   pendingFoodPenalty  STORED queue        -> cleared below
+// Registry of what is stored vs live, as of 2026-10-21 (1.21.1):
+//   maxHealth       STORED attribute        -> reset by applyRealmEffects (new value)
+//   hungerEffect    STORED mob effect       -> cleared below
+//   notify cooldown STORED throttle         -> cleared below
 //   noCrafting      live check              -> no teardown needed
 //   noContainers    live check              -> no teardown needed
 //   noBlockPlacing  live check              -> no teardown needed
-//   foodMultiplier  live check (+ queue)    -> queue cleared below
+//   foodMultiplier  live check, corrected inside the meal itself -> nothing stored
+//   foodCap         live check              -> no teardown needed
+// (The 1.20.1 pendingFoodPenalty queue is gone: the meal is now corrected inside
+// foodEaten, so nothing is queued that could land on the next body.)
 global.SMS.clearPreviousLife = player => {
     var cleared = []
-
-    // A preta who eats and dies before the next tick would otherwise have the food
-    // penalty applied to their NEW body, in a realm that does not have the penalty.
-    try {
-        var key = '' + player.uuid
-        if (global.SMS.pendingFoodPenalty && global.SMS.pendingFoodPenalty[key] !== undefined) {
-            delete global.SMS.pendingFoodPenalty[key]
-            cleared.push('pendingFoodPenalty')
-        }
-    } catch (ignored) {
-        // uuid unreadable; nothing to clear
-    }
 
     // The renewed hunger effect is STORED state on the player: it outlives the realm
     // that applied it, because a MobEffect persists until it lapses or is removed.
@@ -196,13 +207,12 @@ global.SMS.applyRealmEffects = player => {
             (cleared.length > 0 ? ` [cleared from previous life: ${cleared.join(', ')}]` : '')
     )
 
-    // Current health is deliberately NOT touched. There is no setHealth and no
-    // getHealth anywhere in KubeJS (grepped every class in the jar), and every
-    // workaround involves damaging the player, which could kill someone on 1 hp.
-    // Vanilla clamps health to the maximum on its own, so a player who drops from
-    // 20 max to 10 may briefly show a full bar until the next damage or regen tick.
-    // If the bar ever looks wrong after a rebirth, it corrects on the first tick of
-    // damage or regeneration.
+    // Current health is deliberately NOT touched -- the port keeps 1.20.1's behaviour.
+    // (On 1.20.1 there was no reachable setHealth at all; on 1.21.1 vanilla
+    // setHealth/getHealth are callable, so lowering health to the new maximum at once
+    // is now possible -- a proposal, not done unasked.) Vanilla clamps health to the
+    // maximum on its own, so a player who drops from 20 max to 10 may briefly show a
+    // full bar until the next damage or regen tick.
 
     return realm
 }
@@ -213,9 +223,9 @@ PlayerEvents.loggedIn(event => {
 })
 
 // ORDERING. This used to claim it "runs after the rebirth handler has written the new
-// birthRealm". It does not. KubeJS loads server_scripts ALPHABETICALLY, and
-// samsara_realms.js sorts before samsara_rebirth.js, so this handler registered first
-// and therefore ran first -- reading the PREVIOUS life's birthRealm.
+// birthRealm". It does not. This file loads before samsara_rebirth.js (alphabetically
+// on 1.20.1; by priority 60 > 40 on 1.21.1), so this handler registers first and
+// therefore runs first -- reading the PREVIOUS life's birthRealm.
 //
 // That is why forcing naraka and dying left the player on full health: at the moment
 // this ran, birthRealm was still the old realm, so it applied that realm's effects
@@ -229,7 +239,7 @@ PlayerEvents.loggedIn(event => {
 PlayerEvents.respawned(event => {
     // Skip when the rebirth hook is going to handle this respawn itself.
     //
-    // Both files hook this event and alphabetical load order puts THIS one first, so
+    // Both files hook this event and load order puts THIS one first, so
     // it would otherwise run against the previous life's birthRealm -- visible in the
     // log as a stale pair:
     //     born-asura target=20 ...   <- this handler, old realm
@@ -319,9 +329,9 @@ function isContainerBlock(id) {
 
 // Block crafting.
 //
-// Neither ItemEvents.crafted nor PlayerEvents.inventoryChanged is cancellable in
-// KubeJS 6 (checked against the jar: no cancel/setCanceled member on either event),
-// so crafting cannot be prevented outright. Two levers together get close:
+// ItemEvents.crafted is not cancellable on KubeJS 6 or 7 (both jars: it is posted from
+// the craft-result notification, after the fact), so crafting cannot be prevented
+// outright. Two levers together get close:
 //
 //   1. Station access is refused above, which covers the crafting table, anvil,
 //      smithing table, loom, stonecutter and the rest.
@@ -340,121 +350,142 @@ ItemEvents.crafted(event => {
     }
 })
 
-// Block placing.
+// net.minecraft.world.item.BlockItem, for "is this a block the player is placing?".
+// Loaded once. Vanilla classes and methods are callable by Mojang name on 1.21.1.
+// ItemNameBlockItem (seeds, redstone, string) extends it, so planting counts as
+// placing; tools (hoe, axe, shovel), flint and steel, bone meal, buckets and food do
+// not, so an animal can still use them.
+var BlockItemClass = null
+try {
+    BlockItemClass = Java.loadClass('net.minecraft.world.item.BlockItem')
+} catch (e) {
+    console.warn(`[Samsara] could not load BlockItem; animal placement falls back to the id round-trip: ${e}`)
+}
+
+// Is this ItemStack a block the player would place?
+function isBlockItemStack(stack) {
+    if (!stack) return false
+    try {
+        if (stack.isEmpty()) return false
+    } catch (ignored) {
+        return false
+    }
+    if (BlockItemClass) {
+        try {
+            return stack.getItem() instanceof BlockItemClass
+        } catch (ignored2) {
+            // fall through to the round-trip
+        }
+    }
+    // Fallback (the proven 1.20.1 test): a real block id round-trips through the
+    // block registry; a non-block resolves to the registry default, air, and does
+    // not. `!!Block.getBlock(id)` alone is WRONG -- air is a truthy object.
+    try {
+        var heldId = '' + stack.id
+        var resolved = Block.getBlock(heldId)
+        return !!resolved && heldId !== 'minecraft:air' && '' + Block.getId(resolved) === heldId
+    } catch (ignored3) {
+        return false
+    }
+}
+
+// The id of the block a block-item stack places, or '' (not a block item, unreadable).
+function placedIdOf(stack) {
+    if (!isBlockItemStack(stack)) return ''
+    try {
+        return '' + Block.getId(stack.getItem().getBlock())
+    } catch (ignored) {
+        try {
+            return '' + stack.id
+        } catch (ignored2) {
+            return ''
+        }
+    }
+}
+
+// Containers, and block placing (the PRIMARY gate for placing).
 //
-// BlockEvents.placed is NO USE for this: its own javadoc says "Invoked when a block
-// IS placed" -- it is an after-the-fact notification, so cancelling it reverted the
-// block but the item had already left the player's hand.
+// BlockEvents.rightClicked is NeoForge's PlayerInteractEvent.RightClickBlock, posted
+// once per hand with that hand's stack as event.item, so "is the player placing a
+// block" is exact here. Cancelling denies the interaction server-side: nothing is
+// placed, nothing is consumed. (On 1.20.1 the placement cancel sat inside a try,
+// which caught the exit and un-cancelled it -- the likely real cause of the
+// "inconsistent" placement denial recorded then.)
 //
-// The interaction itself is the cancellable point. BlockEvents.rightClicked is wired
-// to Architectury's InteractionEvent$RightClickBlock (returns an EventResult), and
-// placing a block IS a right click on the face of another block. Cancelling there
-// stops the whole interaction, so nothing is placed and nothing is consumed.
-//
-// This handler also covers containers -- both restrictions share the same event, and
-// checking them together avoids two hooks racing on one interaction.
-// NOTE on cancelling interactions: bare event.cancel() maps to INTERRUPT_DEFAULT,
-// which Architectury reads as "no opinion -- carry on with vanilla behaviour". That
-// is why cancelling a rightClicked did nothing while reporting success. To actually
-// DENY an interaction you must pass a result: event.cancel(false) -> INTERRUPT_FALSE.
+// Refused through hasEffect(), which checks liberation. The 1.20.1 handler read the
+// realm's effects directly and so still refused a LIBERATED animal-born player.
 BlockEvents.rightClicked(event => {
     const player = event.player
     if (!player) return
 
-    // Read the effects once, then branch. Gating on a single flag coupled the two
-    // restrictions together -- see the note on hasEffect().
-    const fx = global.SMS.effectsFor(global.SMS.birthRealmOf(player))
-    if (!fx.noContainers && !fx.noBlockPlacing) return
-
     // 1. Containers and workstations: refuse opening them at all.
-    if (fx.noContainers && isContainerBlock(event.block.id)) {
-        event.cancel(false)
-        refuse(player, 'An animal cannot work that.')
-        return
+    if (hasEffect(player, 'noContainers')) {
+        var id = ''
+        try {
+            id = '' + event.block.id
+        } catch (ignored) {
+            id = ''
+        }
+        if (id && isContainerBlock(id)) {
+            refuse(player, 'An animal cannot work that.')
+            event.cancel()
+        }
     }
 
-    // 2. Block placing: refuse if the player is holding a placeable block.
-    if (!fx.noBlockPlacing) return
-
-    try {
-        var held = event.item
-        if (!held || held.isEmpty()) return
-
-        // Only refuse actual BLOCK items, so food, tools and weapons stay usable and
-        // an animal can still eat and fight.
-        //
-        // `!!Block.getBlock(id)` was WRONG. Block.getAllIds() does not exist, but
-        // Block.getBlock() routes through RegistryInfo.BLOCK, and a vanilla registry
-        // lookup returns its DEFAULT value -- minecraft:air -- for an id that is not a
-        // block, rather than null. air is a truthy object, so this test reported
-        // "is a block" for EVERY item: a sword, food, a bucket, everything. The animal
-        // realm was refusing all right-click item use, not just placement.
-        //
-        // Correct test: resolve the id back out of the registry and compare. A real
-        // block round-trips to its own id; a non-block resolves to air and does not.
-        var isBlockItem = false
-        try {
-            var heldId = '' + held.id
-            var resolved = Block.getBlock(heldId)
-            if (resolved) {
-                var backId = '' + Block.getId(resolved)
-                isBlockItem = backId === heldId && heldId !== 'minecraft:air'
-            }
-        } catch (e) {
-            isBlockItem = false
-        }
-        if (!isBlockItem) return
-
-        event.cancel(false)
+    // 2. Block placing: refuse when the item in THIS hand is a block. Food, tools,
+    //    weapons and buckets stay usable, so an animal can still eat, dig and fight.
+    //    (Holding a block also means doors and levers cannot be worked with that hand.)
+    if (hasEffect(player, 'noBlockPlacing') && isBlockItemStack(event.item)) {
         refuse(player, 'An animal cannot place blocks.')
-    } catch (ignored) {
-        // if we cannot tell what is held, allow the interaction
+        event.cancel()
     }
 })
 
-// SECOND LINE OF DEFENCE.
+// SECOND LINE OF DEFENCE for placing: refuse a placement the interaction gate missed.
 //
-// event.cancel(false) on rightClicked works only INCONSISTENTLY for placement --
-// verified in game: one attempt was stopped by the interaction cancel alone, while
-// another slipped through and only this hook caught it. Likely an offhand/mainhand
-// or client-prediction race.
+// On KubeJS 7 this is NeoForge's BlockEvent.EntityPlaceEvent, and cancelling it makes
+// CommonHooks.onPlaceItemIntoWorld restore the block snapshot AND leave the item stack
+// at its pre-use count -- a clean refusal with the refund built in, safe in creative
+// (read from the jar). On 1.20.1 it was a notification only, which is why the old
+// version reverted to air and could not refund.
 //
-// So both run: the interaction cancel prevents most placements cleanly, and this
-// reverts anything that gets through and hands the item back. The player may see a
-// brief flicker when the fallback is the one that fires, but nothing is lost.
+// BUT NeoForge fires this event for EVERY block change made through an item's useOn,
+// except buckets: a hoe's farmland, an axe's stripped log, a shovel's path, fire from
+// flint and steel, a crop grown by bone meal. Refusing all of them would take an
+// animal's tools away. So this refuses only a placement whose block a held block item
+// actually places. (Wall variants -- a wall torch from a torch -- do not match here;
+// the interaction gate above catches those.)
+//
+// event.entity is null for a dispenser and non-player for an enderman; hasEffect()
+// returns false for both, so a machine's placement is never refused on a player's
+// behalf.
 BlockEvents.placed(event => {
-    // event.entity is nullable -- a dispenser or piston placing a block has no entity.
-    // hasEffect() already returns false for null, but be explicit: a machine's
-    // placement is not a player's and must never be reverted on a player's behalf.
     const player = event.entity
-    if (!player) return
     if (!hasEffect(player, 'noBlockPlacing')) return
 
+    var placedId = ''
     try {
-        var id = '' + event.block.id
-        if (!id || id === 'minecraft:air') return
-
-        event.block.set('minecraft:air')
-
-        // DO NOT REFUND.
-        //
-        // The previous version called player.give(id) unconditionally, which duplicates
-        // the block in creative mode -- the stack is never consumed there, so give()
-        // hands back a block the player still holds. Testing happens in creative, so
-        // this was easy to hit.
-        //
-        // There is no way to check the gamemode: grepping the whole jar finds
-        // kjs$setCreativeMode (write-only) and no getter at all -- no isCreative, no
-        // getGameMode, no GameType accessor. So the mode cannot be branched on.
-        //
-        // The refund is dropped instead. It only ever mattered when `rightClicked`
-        // failed to deny the interaction, which is the inconsistent path, and losing
-        // one block in that rare case is far better than a duplication exploit. The
-        // message tells the player what happened.
-        refuse(player, 'An animal cannot place blocks.')
+        placedId = '' + event.block.id
     } catch (ignored) {
-        // if the revert fails the player simply keeps the placed block
+        return
     }
+    var fromHeld = false
+    try {
+        fromHeld = placedIdOf(player.getMainHandItem()) === placedId
+    } catch (ignored2) {
+        fromHeld = false
+    }
+    if (!fromHeld) {
+        try {
+            fromHeld = placedIdOf(player.getOffhandItem()) === placedId
+        } catch (ignored3) {
+            fromHeld = false
+        }
+    }
+    if (!fromHeld) return
+
+    refuse(player, 'An animal cannot place blocks.')
+    event.cancel()
 })
 
 // ---- Preta (hungry ghost) realm --------------------------------------------
@@ -463,44 +494,28 @@ BlockEvents.placed(event => {
 // Once feeding others exists (design doc 7), giving food away will be the efficient
 // way to eat, and generosity becomes the escape route rather than a side activity.
 //
-// TIMING. FoodEatenEventJS fires BEFORE the food is applied, not after.
-// LivingEntityMixin injects kjs$foodEaten at @At("HEAD") of LivingEntity.eat()
-// (verified by dumping the mixin), so when this handler runs the player's foodLevel
-// is still the PRE-meal value and vanilla adds the full nutrition immediately after
-// we return. Deferring the correction is the only option -- the event is not
-// cancellable and has no post-hook.
+// TIMING (read from both jars, 2026-10-21 -- the 1.20.1 version never worked). KubeJS
+// fires foodEaten at HEAD of LivingEntity.eat(), but Player.eat() calls
+// getFoodData().eat(food) FIRST and only then super.eat(). So for a PLAYER this
+// handler sees the bar AFTER the meal. The 1.20.1 version took a "pre-meal" snapshot
+// here, measured gained = 0 on the next tick and left through "no measurable gain":
+// the multiplier never applied. The 3-icon cap landed the bar on 3 either way, which
+// is what hid it.
 //
-// WHY WE MEASURE THE MEAL INSTEAD OF READING THE ITEM (verified against the jar,
-// 2026-10-18 -- this was a SILENT total failure: eating restored the FULL bar).
-// The previous version asked the item how much it would give:
-//     nutrition = Number(item.foodProperties.nutrition)
-// Nothing in that chain is reachable here, so it threw, the catch set nutrition = 0,
-// the `if (!nutrition) return` queued nothing, and the penalty never ran at all.
-//   - `event.item` is an ItemStack, and ItemStackKJS has NO food member whatsoever.
-//     Its complete kjs$ list is: areItemsEqual asIngredient enchantCopy
-//     equalsIgnoringCount getEnchantments getHarvestSpeed getId getIdLocation getMod
-//     getNbtString getTags getTypeData hasEnchantment hasTag ignoreNBT isBlock
-//     isNBTEqual removeTag self strongNBT toItemString weakNBT withChance withCount
-//     withLore withNBT withName. No foodProperties.
-//   - `foodProperties` exists only on ItemKJS/ItemMixin and only as a SETTER
-//     (kjs$overrideFood, signature (Lnet/minecraft/world/food/FoodProperties;)V --
-//     void, takes an argument). There is no getter for a read to remap onto.
-//   - The string "nutrition" appears NOWHERE in the KubeJS jar. FoodBuilder calls
-//     that field `hunger`, and FoodProperties' own accessors are raw obfuscated
-//     names (m_38744_ etc.) on a vanilla object with no read remap.
-// So a meal's size cannot be predicted from script. It CAN be measured: snapshot
-// foodLevel + saturation at HEAD, read them again next tick, and take back the
-// preta's share of whatever vanilla actually added. This uses only proven bean
-// members on PlayerKJS (kjs$getFoodLevel / kjs$setFoodLevel / kjs$getSaturation /
-// kjs$setSaturation) and it handles modded and custom food for free, which the item
-// read never would have.
+// THE MEAL IS READABLE on 1.21.1: Item.finishUsingItem passes exactly
+// stack.getFoodProperties(entity) to eat(), FoodProperties.nutrition() is a plain
+// accessor, and the stack is not consumed until later in LivingEntity.eat(). So the
+// correction is exact and immediate -- no queue, no cross-tick state, nothing that
+// could land on the next body after a death.
 //
-// On global.SMS so global.SMS.clearPreviousLife() can discard a queued penalty when
-// the player is reborn. A preta who eats and dies in the same tick must NOT have the
-// penalty applied to their next body. Still keyed by uuid string, so the teardown in
-// clearPreviousLife needs no change.
-global.SMS.pendingFoodPenalty = global.SMS.pendingFoodPenalty || {}
-
+// Writers of foodLevel, in tick order (the project notes: enumerate the writers before
+// constraining a value): vanilla FoodData.tick (exhaustion and regen; the hunger
+// effect adds exhaustion) -> vanilla FoodData.eat (the meal) -> THIS correction,
+// inside the same eat() call -> the preta clamp below (every 4 ticks, DOWN only). The
+// correction undoes what the meal did; the clamp then enforces the standing ceiling
+// on the result. Because the correction runs inside eat(), that order is inherent,
+// not a matter of handler registration -- and with no drain left for the clamp to
+// eat, the 2026-10-18 "clamp swallows the drain" failure cannot recur.
 ItemEvents.foodEaten(event => {
     // DIAGNOSTIC LOGGING (config.debugFood). Every exit path below is logged when it
     // is on, because every one of them is a SILENT return: the old version of this
@@ -543,162 +558,68 @@ ItemEvents.foodEaten(event => {
         return
     }
 
+    // The bar as vanilla left it: ALREADY raised by this meal (see TIMING above).
+    var cur = Number(player.foodLevel)
+    if (!isFinite(cur)) {
+        // The one failure that would be invisible AND fatal to the penalty, so it
+        // warns even with the diagnostic off.
+        console.warn('[Samsara] foodEaten: player.foodLevel unreadable; penalty skipped')
+        return
+    }
+
+    // Saturation goes entirely, on every path below: a hungry ghost is never
+    // satisfied. Done first so an early return cannot skip it.
     try {
-        // Snapshot the PRE-meal state. We are at @At("HEAD") of eat(), so these are
-        // still the values from before this meal.
-        var beforeFood = Number(player.foodLevel)
-        if (!isFinite(beforeFood)) {
-            // This is the one failure that would be invisible AND fatal to the
-            // penalty, so it warns even with the diagnostic off.
-            console.warn('[Samsara] foodEaten: player.foodLevel unreadable; penalty skipped')
-            return
-        }
+        var sat = Number(player.saturation)
+        if (isFinite(sat) && sat > 0) player.setSaturation(0)
+    } catch (ignored) {
+        // saturation unwritable; the food correction below still runs
+    }
 
-        var beforeSat = Number(player.saturation)
-        if (!isFinite(beforeSat)) beforeSat = 0
+    // What this meal gave. Never silent on failure: the 1.20.1 hook's silent catch
+    // hid an unreachable nutrition read for a whole test round.
+    var nutrition = NaN
+    try {
+        nutrition = Number(event.item.getFoodProperties(player).nutrition())
+    } catch (e) {
+        console.warn(`[Samsara] foodEaten: meal nutrition unreadable; preta meal kept in full: ${e}`)
+        return
+    }
+    if (!isFinite(nutrition) || nutrition <= 0) {
+        if (dbg) console.info(`[Samsara] foodEaten: meal gives no nutrition (${nutrition}); saturation cleared only`)
+        return
+    }
 
-        var key = '' + player.uuid
+    try {
+        // Back out the meal, then keep the preta's share. `cur - nutrition` is exact
+        // unless vanilla clamped the bar at 20 (pre + nutrition > 20); then it reads
+        // LOW, which only ever costs the preta, never feeds it. A capped preta sits
+        // at <= foodCap, so that needs a 15-point food.
+        var pre = cur - nutrition
+        if (pre < 0) pre = 0
+        // FLOOR, not round, so the penalty can never round UP into a free point. A
+        // meal worth less than 1/mult points therefore feeds a preta nothing at all,
+        // which is the intent.
+        var kept = Math.floor(nutrition * mult)
+        var next = pre + kept
+        if (next > cur) next = cur // never ADD food
+        player.setFoodLevel(Math.floor(next))
 
-        // If a snapshot is already queued (two meals inside one tick), keep the
-        // EARLIER one: it is the true pre-eating baseline for this tick, so the
-        // single correction below still reduces both meals to the right level.
-        if (global.SMS.pendingFoodPenalty[key] === undefined) {
-            global.SMS.pendingFoodPenalty[key] = {
-                food: beforeFood,
-                sat: beforeSat,
-                mult: mult,
-            }
-            if (dbg) {
-                console.info(
-                    `[Samsara] foodEaten: queued snapshot for born-${realm}` +
-                        ` food=${beforeFood} sat=${beforeSat} mult=${mult}`
-                )
-            }
-        } else if (dbg) {
-            console.info('[Samsara] foodEaten: snapshot already queued this tick; kept the earlier one')
+        if (dbg) {
+            console.info(
+                `[Samsara] preta meal: ${player.profile.name} nutrition ${nutrition}` +
+                    ` -> kept ${kept} (mult ${mult}); food ${cur} -> ${Math.floor(next)}`
+            )
         }
     } catch (e) {
-        // The old hook's silent catch here is exactly what hid the unreachable
-        // nutrition read for a whole test round. Never silent again.
-        console.warn(`[Samsara] foodEaten: snapshot failed: ${e}`)
+        console.warn(`[Samsara] foodEaten: preta correction failed: ${e}`)
     }
 })
 
-// Apply the deferred preta food penalty, one tick after the meal.
+// ---- The preta tick: the clamp ----------------------------------------------
 //
-// Players are found by scanning the online list rather than via server.getPlayer():
-// kjs$getPlayer takes a PlayerSelector, not a UUID string (verified in the jar), and
-// relying on Rhino to coerce a string into that type is exactly the kind of guess
-// that fails silently here. The online list is small, and this only runs on ticks
-// where a penalty is actually queued.
-// Drain the deferred meal penalties queued by the foodEaten hook above.
-//
-// Split out of the tick handler so the handler can call it BEFORE the preta ceiling
-// without the drain's early returns (empty queue, no player list) skipping the clamp.
-global.SMS.drainFoodPenalties = server => {
-var keys = Object.keys(global.SMS.pendingFoodPenalty)
-
-    var dbgDrain = false
-    try {
-        dbgDrain = global.SMS.config.debugFood === true
-    } catch (ignored) {
-        dbgDrain = false
-    }
-
-    var online = null
-    try {
-        online = server.players
-    } catch (ignored) {
-        return
-    }
-    if (!online) {
-        return
-    }
-
-    for (var i = 0; i < keys.length; i++) {
-        var key = keys[i]
-        var snap = global.SMS.pendingFoodPenalty[key]
-        delete global.SMS.pendingFoodPenalty[key]
-        if (!snap) continue
-
-        var player = null
-        try {
-            for (var j = 0; j < online.size(); j++) {
-                var p = online.get(j)
-                if (('' + p.uuid) === key) {
-                    player = p
-                    break
-                }
-            }
-        } catch (ignored) {
-            player = null
-        }
-        if (!player) continue
-
-        try {
-            var cur = Number(player.foodLevel)
-            if (!isFinite(cur)) {
-                console.warn('[Samsara] food drain: foodLevel unreadable; meal kept in full')
-                continue
-            }
-
-            // Saturation goes entirely, on every path below: a hungry ghost is never
-            // satisfied. Done first so an early `continue` cannot skip it.
-            var sat = Number(player.saturation)
-            if (isFinite(sat) && sat > 0) player.setSaturation(0)
-
-            // What did the meal ACTUALLY restore? Vanilla has finished eating by now.
-            var gained = cur - snap.food
-            if (!isFinite(gained) || gained <= 0) {
-                if (dbgDrain) {
-                    console.info(
-                        `[Samsara] food drain: no measurable gain (before=${snap.food}` +
-                            ` after=${cur}); saturation cleared only`
-                    )
-                }
-                continue // ate on a full bar
-            }
-
-            // The preta keeps only `mult` of it. FLOOR, not round, so the penalty can
-            // never round UP into a free point. A meal worth less than 1/mult points
-            // therefore feeds a preta nothing at all, which is the intent.
-            var kept = Math.floor(gained * snap.mult)
-            var next = snap.food + kept
-            if (next < 0) next = 0
-            if (next > cur) next = cur // never ADD food
-            player.setFoodLevel(Math.floor(next))
-
-            if (dbgDrain) {
-                console.info(
-                    `[Samsara] food drain: ${player.profile.name} gained ${gained}` +
-                        ` -> kept ${kept} (mult ${snap.mult}); food ${cur} -> ${Math.floor(next)}`
-                )
-            }
-        } catch (e) {
-            console.warn(`[Samsara] food drain failed: ${e}`)
-        }
-    }
-}
-
-// ---- The preta tick: drain, THEN clamp ---------------------------------------
-//
-// ORDER IS LOAD-BEARING, and getting it wrong broke the drain completely.
-//
-// Observed in game 2026-10-18: "eating cooked beef restores the normal amount, but it
-// immediately resets back to 3". The clamp was running FIRST on every 4th tick: it set
-// foodLevel to the cap, and the drain then measured `gained = cap - snapshot` = 0 and
-// bailed out through its own "ate on a full bar" branch. The ceiling destroyed the
-// penalty it was supposed to sit on top of -- the failure mode the project notes warn about,
-// where a guard costs the thing it guards.
-//
-// The cap MASKED this: the bar lands on 3 either way, so the only way to tell the two
-// apart is the drain's own log line (config.debugFood).
-//
-// Draining first is also the right meaning: the drain corrects what THIS MEAL added,
-// and the ceiling then enforces the standing limit on the corrected result.
+// Only the clamp runs on the tick now: the meal itself is corrected inside foodEaten.
 ServerEvents.tick(event => {
-    global.SMS.drainFoodPenalties(event.server)
-
     global.SMS.pretaCounter++
     if (global.SMS.pretaCounter >= PRETA_INTERVAL_TICKS) {
         global.SMS.pretaCounter = 0
@@ -718,24 +639,18 @@ ServerEvents.tick(event => {
 // on a timer rather than every tick because it is a clamp, not a reaction -- there is
 // nothing to miss by checking 5x/second instead of 20x.
 //
-// WHY /effect AND NOT getPotionEffects().add(). Jar-verified 2026-10-18:
+// WHY /effect AND NOT getPotionEffects().add(). Jar-verified 2026-10-18 on KubeJS 6:
 // EntityPotionEffectsJS.add's overloads all take a net.minecraft MobEffect OBJECT
 // ((Lnet/minecraft/world/effect/MobEffect;IIZZ)V and friends) -- there is NO
-// String-id overload, and BuiltinKubeJSPlugin registers NO MobEffect type wrapper,
-// so Rhino has nothing to coerce 'minecraft:hunger' with. That is project trap 8
-// (overloads must match exactly) and it fails silently. kjs$runCommandSilent takes a
-// plain Ljava/lang/String; (verified on EntityKJS), so the command is the seam that
-// actually works from script.
+// String-id overload, and BuiltinKubeJSPlugin registered NO MobEffect type wrapper,
+// so Rhino had nothing to coerce 'minecraft:hunger' with. That is project trap 8
+// (overloads must match exactly) and it fails silently. runCommandSilent takes a
+// plain String on KubeJS 6 and 7 alike, and /effect's syntax is unchanged in 1.21.1,
+// so the command stays the seam.
 //
 // NOTE the /effect command takes SECONDS, while the config carries TICKS (every other
 // duration in this pack is in ticks, and mixing the two units is how this goes wrong
 // silently). The conversion happens here, once.
-//
-// THIS LIVES IN THE SAME HANDLER as the meal drain above, deliberately. Two separate
-// ServerEvents.tick registrations would leave the order between "take back the meal"
-// and "enforce the ceiling" up to registration order, which the project notes' rule about
-// handler order being filename order says not to rely on. Running the drain first and
-// the clamp second, in one function, makes the sequence explicit.
 global.SMS.enforcePretaHunger = server => {
     var players = null
     try {
@@ -820,41 +735,42 @@ global.SMS.enforcePretaHunger = server => {
 
 // SECOND LINE OF DEFENCE FOR CONTAINERS.
 //
-// BlockEvents.rightClicked is the only cancellable hook for opening a container, and
-// the handoff records it working only INCONSISTENTLY for placement (one attempt
-// blocked, the next slipping through). There is no reason to assume containers are
-// immune to the same race, and "an animal opened a chest" is exactly the symptom that
-// was reported.
+// BlockEvents.rightClicked is the only cancellable hook for opening a container. Any
+// menu that still opens -- a container reached some other way, a modded block whose
+// id the suffix list misses -- is shut here.
 //
-// Neither PlayerEvents.inventoryOpened nor ChestEventJS is cancellable -- verified by
-// dumping InventoryEventJS and ChestEventJS, neither has a cancel member. But
-// `closeMenu` IS reachable: PlayerMixin carries @RemapForJS m_6915_ -> closeMenu.
-//
-// So if a container menu does open for a restricted player, shut it immediately. The
-// player may see a single frame of the GUI, which matches the placement fallback's
-// behaviour and is acceptable for a restriction that must hold.
+// PlayerEvents.inventoryOpened is not cancellable (NeoForge PlayerContainerEvent.Open,
+// both jars). But closeMenu IS reachable: PlayerMixin remaps closeContainer ->
+// closeMenu on KubeJS 6 and 7. The player may see a single frame of the GUI, which is
+// acceptable for a restriction that must hold.
+
+// The player's own inventory menu. Loaded once; null if it cannot be loaded, in which
+// case the guard below fails OPEN rather than risk locking a player out.
+var InventoryMenuClass = null
+try {
+    InventoryMenuClass = Java.loadClass('net.minecraft.world.inventory.InventoryMenu')
+} catch (e) {
+    console.warn(`[Samsara] could not load InventoryMenu; the container backstop is off: ${e}`)
+}
+
 PlayerEvents.inventoryOpened(event => {
     const player = event.entity
     if (!player) return
     if (!hasEffect(player, 'noContainers')) return
 
-    // The player's OWN inventory also fires this event and must stay usable -- an
-    // animal still carries items.
-    //
-    // InventoryEventJS exposes only getEntity and getInventoryContainer; there is NO
-    // getBlock on it (that exists only on ChestEventJS), so the backing block cannot
-    // be inspected here. Distinguish by the menu's CLASS NAME instead: the player's
-    // own inventory is an InventoryMenu, every block container is something else
-    // (ChestMenu, FurnaceMenu, ...).
-    var menuName = ''
+    // The player's OWN inventory must stay usable -- an animal still carries items.
+    // (The server never sends an "open" for it, so this is belt and braces.) Tested
+    // with instanceof against the vanilla class: the 1.20.1 test read the class NAME
+    // through getClass(), which KubeJS's class filter may not allow.
+    var menu = null
     try {
-        menuName = '' + event.inventoryContainer.getClass().getSimpleName()
+        menu = event.inventoryContainer
+        if (!menu || !InventoryMenuClass || menu instanceof InventoryMenuClass) return
     } catch (ignored) {
         // cannot identify the menu -- do nothing rather than risk locking a player
         // out of their own inventory.
         return
     }
-    if (!menuName || menuName === 'InventoryMenu') return
 
     try {
         player.closeMenu()

@@ -1,7 +1,9 @@
+// priority: 100
 // Samsara — config. All tunable numbers live here. Edit values and run /reload to apply.
 //
-// Shared across the other samsara_*.js files via the global.SMS namespace so load
-// order between files does not matter (everything is read at runtime, not load time).
+// Shared across the other samsara_*.js files via the global.SMS namespace, and read at
+// runtime, not load time. Highest priority anyway (KubeJS 7 loads `// priority: N`
+// highest first, then by path): every other file may assume global.SMS.config exists.
 
 global.SMS = global.SMS || {}
 
@@ -192,8 +194,10 @@ global.SMS.config = {
     endurance: {
         enabled: true,
 
-        // Damage summed across the encounter, as reported by the hurt event (before
-        // armor). 4.0 = two hearts: about two zombie hits.
+        // Damage summed across the encounter: RAW incoming damage, before shield,
+        // invulnerability frames and armor (NeoForge LivingIncomingDamageEvent -- the
+        // same point 1.20.1's EntityEvents.hurt measured). 4.0 = two hearts: about two
+        // zombie hits.
         minDamage: 4.0,
 
         // 200 ticks = 10 s without a hostile hit closes the encounter.
@@ -201,10 +205,16 @@ global.SMS.config = {
 
         // ---- Anti-farm. Each bounds a different exploit; all are needed. ----
 
-        // Mobs from a spawner (BaseSpawner) never open an encounter. Tagged at spawn
-        // via EntityEvents.checkSpawn, whose getSpawner() is null for natural spawns.
-        // This is what stops "stand next to a caged spawner".
+        // Mobs from a spawner never open an encounter. Tagged at spawn via
+        // EntityEvents.checkSpawn by their spawn TYPE (below). This is what stops
+        // "stand next to a caged spawner".
         ignoreSpawnerMobs: true,
+
+        // Which MobSpawnType names count as "from a spawner". On KubeJS 7, checkSpawn
+        // is NeoForge's FinalizeSpawnEvent and event.spawner is never null, so the type
+        // is the only reliable signal. TRIAL_SPAWNER (new in 1.21) counts too: a trial
+        // chamber is a spawner you can stand beside.
+        spawnerSpawnTypes: ['SPAWNER', 'TRIAL_SPAWNER'],
 
         // At most one award per this window. 6000 = 5 min.
         awardWindowTicks: 6000,
@@ -517,8 +527,9 @@ global.SMS.config = {
     // that measures both.
 
     // ---- Victim classification overrides ------------------------------------
-    // isMonster() maps to vanilla's Monster/Enemy type, which puts several mobs on the
-    // wrong side of the line for this mod. These lists are checked BEFORE it.
+    // isMonster() is KubeJS's MobCategory test (true only for MONSTER), and isAnimal()
+    // is true for CREATURE and MISC alike, so the categories put several mobs on the
+    // wrong side of the line for this mod. These lists are checked BEFORE them.
 
     // Treated as villager-class: the heaviest kill in the game. These are beings a
     // player trades and lives alongside.
@@ -530,15 +541,15 @@ global.SMS.config = {
 
     // Treated as hostile regardless of vanilla's type hierarchy.
     hostileEntities: [
-        // Hoglins are Animals in vanilla, so isMonster() is false -- but they attack
-        // on sight and are a normal Nether food source. Charging the passive rate for
-        // them punished ordinary survival.
+        // Hoglins attack on sight and are a normal Nether food source. Their category
+        // is MONSTER already; listed so the verdict never depends on a modded
+        // category change.
         'minecraft:hoglin',
         'minecraft:zoglin',
-        // Slimes and magma cubes are Mob + Enemy, not Monster, in some mappings.
+        // Slimes and magma cubes: listed for the same reason.
         'minecraft:slime',
         'minecraft:magma_cube',
-        // Bosses. Not Monster in every mapping, and plainly not passive.
+        // Bosses: plainly not passive, whatever category a mod gives them.
         'minecraft:ender_dragon',
         'minecraft:wither',
         'minecraft:phantom',
@@ -936,14 +947,17 @@ global.SMS.config = {
     debugFood: true,
 
     // Log every endurance encounter as it opens, spoils and closes. Like the food
-    // hook, every path through it is a silent return otherwise. OFF since the
-    // 2026-10-20 in-game test confirmed the open / spoiled / spawner / award-window /
-    // death paths; turn it back on to debug endurance. (The award line itself is
-    // always logged.)
-    debugEndurance: false,
+    // hook, every path through it is a silent return otherwise. ON for the first
+    // 1.21.1 test: both of endurance's game hooks changed in the port (the raw-damage
+    // listener and spawn-type tagging), so the open / spoiled / spawner / award-window
+    // / death paths need re-confirming. Turn off once they are. (The award line itself
+    // is always logged.)
+    debugEndurance: true,
 
     // ---- NBT keys -----------------------------------------------------------
-    // Stored inside the Forge PlayerPersisted tag (survives death + relog).
+    // Stored inside the PlayerPersisted sub-tag of player.persistentData. On KubeJS 7
+    // that is KubeJS's own tag (KubeJSPersistentData in entity NBT), copied whole to
+    // the new body on every clone; see samsara_karma.js.
     nbt: {
         statPrefix: 'samsara_', // e.g. samsara_hatred
         birthRealm: 'samsara_birth_realm',

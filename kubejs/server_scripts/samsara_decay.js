@@ -1,6 +1,12 @@
+// priority: 50
 // Samsara — karma ripening, and the shared tick clock.
 //
 // (The filename is historical: this file once held passive decay too.)
+//
+// PRIORITY 50, same as samsara_karma.js: no ordering dependency of its own (it
+// registers no death handler). At equal priority KubeJS 7 sorts by path, so this file
+// loads just before karma -- its tick clock increments before karma's encounter drain,
+// as it did under 1.20.1's alphabetical order.
 //
 // Karma is spent in exactly one way: REBIRTH (ripening). The karma that CAUSED a
 // birth is spent when that birth ends. This is realm-specific: a deva's merit burns
@@ -59,11 +65,13 @@ global.SMS.scaleAllStats = (player, keep) => global.SMS.scaleStats(player, keep,
 
 // A pure-JS tick clock.
 //
-// We cannot read the world time for this: Level.getTime() returns a Java `long`
-// (signature ()J), and Rhino will not coerce a Java long into a JS number --
-// Number(server.overworld.time) yields NaN. That made every cooldown comparison
-// false and silently disabled the anti-farm guard. Counting ticks ourselves keeps
-// everything in JS number space.
+// On 1.20.1, Number(server.overworld.time) read as NaN, which made every cooldown
+// comparison false and silently disabled the anti-farm guard. (The recorded cause --
+// "Rhino will not coerce a Java long" -- does not match either Rhino's bytecode, which
+// unwraps any java.lang.Number; the NaN was real, its cause is unknown.) Counting
+// ticks ourselves keeps everything in JS number space, and the clock has its own
+// reasons besides: it survives /reload and the harness drives it directly. Do not
+// switch to world time without a probe.
 //
 // PRESERVED ACROSS /reload. `global.SMS.tickClock = 0` (unconditional) reset the
 // clock every time the scripts reloaded, which silently broke two things:
@@ -92,11 +100,12 @@ ServerEvents.tick(event => {
 // rates by repeatFalloff^streak, and the delusion award (samsara_karma.js) scales a
 // repeat death's delusion by repeatFalloff^(streak-1). Both must call this BEFORE
 // ripenKarma records the current death; the delusion handler does, because
-// samsara_karma.js registers its death handler before samsara_rebirth.js.
+// samsara_karma.js (priority 50) registers its death handler before
+// samsara_rebirth.js (priority 40).
 //
-// NOTE: putDouble/getDouble only. getLong/getInt are unverified on this
-// CompoundTag binding, and an unsupported NBT method fails SILENTLY here rather
-// than throwing -- a double represents tick counts and small ints exactly.
+// NOTE: putDouble/getDouble only. getLong/getInt exist on 1.21.1's Mojang-named
+// CompoundTag, but the stored schema stays all-double for continuity with the
+// harness's fake tag -- a double represents tick counts and small ints exactly.
 global.SMS.rapidDeathStreak = player => {
     const nbt = global.SMS.config.nbt
     const tag = global.SMS.persistedTag(player)

@@ -1,5 +1,12 @@
+// priority: 40
 // Samsara — rebirth: on death, route the player to the realm their karma dictates and
 // land them somewhere survivable.
+//
+// PRIORITY 40, the lowest of the gameplay files: on a player death, route + ripen
+// must run LAST, after samsara_karma.js (50) has added this death's delusion and
+// settled endurance -- both read the PREVIOUS death that ripening overwrites. And
+// samsara_realms.js (60) must register its respawn safety net before this file's
+// respawn handler. KubeJS 7 orders files by `// priority: N` (higher first), then path.
 //
 // REWRITTEN. The previous version had grown four layers of patches over a search that
 // could cost ~5.3M block reads per death and could bake a stone platform into the
@@ -7,10 +14,11 @@
 //
 // The search is now built around three facts established against the jar and in game:
 //
-//   1. There is NO heightmap and NO collision API in KubeJS 6. BlockContainerJS gives
-//      getBlockState / getId / hasTag / getTags / getCanSeeSky / getLight only, so
-//      "is this solid ground" has to be a tag+deny-list judgement and "is this the
-//      surface" has to be getCanSeeSky.
+//   1. There was NO heightmap and NO collision API in KubeJS 6, so "is this solid
+//      ground" is a block-id deny-list judgement and "is this the surface" is
+//      getCanSeeSky. KubeJS 7's LevelBlock still has no collision API; vanilla
+//      blockState methods are callable on 1.21.1, but the id predicates stay -- they
+//      are what the harness models and what the in-game tests verified.
 //   2. getCanSeeSky is the ONLY reliable surface test available, so for a realm with a
 //      sky it is a HARD gate, never a preference that gets relaxed. Relaxing it is
 //      what put a human rebirth at y=-19, inside a cave.
@@ -106,13 +114,37 @@ function idOf(block) {
     }
 }
 
+// Write a block by id. LevelBlock.set takes a Block; whether KubeJS 7 coerces a
+// registry-id STRING into one is unverified, so try the string first and fall back
+// to an explicit Block.getBlock lookup. Only the carved-pocket fallback writes blocks.
+function setBlockId(block, id) {
+    try {
+        block.set(id)
+        return
+    } catch (ignored) {
+        // no string coercion: resolve the Block ourselves
+    }
+    block.set(Block.getBlock(id))
+}
+
+// Best-effort chunk load. KubeJS 6 had LevelBlock.getChunk(); KubeJS 7 does not (it
+// threw inside a try and silently did nothing), so call vanilla Level.getChunk(cx, cz),
+// which loads or generates the chunk. The block reads of the search would fault it in
+// anyway; this keeps the intent explicit.
+function loadChunkAt(level, bx, bz) {
+    try {
+        level.getChunk(bx >> 4, bz >> 4)
+    } catch (ignored) {
+        // the block reads below fault it in anyway
+    }
+}
+
 // Is this block empty space the body can occupy?
 //
-// Uses the block ID, NOT blockState.isAir(). BlockStateKJS exposes only three kjs$
-// setters and there is no @RemapForJS for isAir, so blockState.isAir() is a
-// Mojang-mapped call that is unreachable here -- it throws, every predicate's catch
-// returns "unsafe", and the entire search fails into the platform fallback. That is
-// the most likely reason the old search never found ground.
+// Uses the block ID, NOT blockState.isAir(). On 1.20.1 isAir() was an SRG-named call
+// unreachable from script -- it threw, every predicate's catch returned "unsafe", and
+// the entire search failed into the platform fallback. It is callable on 1.21.1, but
+// the id test is kept: same verdicts, and it is what the harness models.
 function isClear(block) {
     var id = idOf(block)
     if (id === '') return false
@@ -631,11 +663,7 @@ global.SMS.pickDestination = player => {
 
     // Force the anchor chunk to load. An unloaded chunk reads as all air, so every
     // column looks empty and the search finds nothing.
-    try {
-        level.getBlock(bx, anchor.y, bz).getChunk()
-    } catch (ignored) {
-        // no getChunk on this binding; the reads below still fault the chunk in
-    }
+    loadChunkAt(level, bx, bz)
 
     const cavern = cfg.cavernRealms.indexOf(realm) !== -1
     const skyMode = cavern ? 'ignore' : 'require'
@@ -702,11 +730,11 @@ global.SMS.pickDestination = player => {
             // replace real terrain.
             var floorBlock = level.getBlock(bx, py - 1, bz)
             if (!isGround(floorBlock)) {
-                floorBlock.set(cfg.safeSpawn.fallbackFloorBlock)
+                setBlockId(floorBlock, cfg.safeSpawn.fallbackFloorBlock)
             }
             // Clear the body space and a little headroom.
             for (var cy = 0; cy <= 2; cy++) {
-                level.getBlock(bx, py + cy, bz).set('minecraft:air')
+                setBlockId(level.getBlock(bx, py + cy, bz), 'minecraft:air')
             }
         } catch (e) {
             console.warn(`[Samsara] could not carve a fallback pocket: ${e}`)
@@ -808,8 +836,8 @@ global.SMS.grantLiberation = (player, reason) => {
 //
 // Pointing the vanilla respawn position AT the rebirth destination is what removes the
 // bed flicker: vanilla places the player there itself, so there is no frame at the bed
-// to see. kjs$setSpawnLocation(BlockContainerJS) calls the real setter
-// (m_9158_ = setRespawnPosition), verified in the jar.
+// to see. setSpawnLocation(LevelBlock) calls the real setter, setRespawnPosition(dim,
+// pos, angle, forced = true, ...), verified in the KubeJS 6 and 7 jars.
 //
 // Editing SpawnX/SpawnY/SpawnZ NBT does NOT work -- that is only the serialized form.
 EntityEvents.death(event => {
@@ -916,20 +944,21 @@ PlayerEvents.respawned(event => {
     const cfg = global.SMS.config
 
     // CRITICAL: this event also fires when a player returns from the End through the
-    // exit portal -- the event's own javadoc says "The reason of respawn can be either
-    // death or returning from the end", and getKeepData() distinguishes them.
+    // exit portal. Without this guard, walking out of the End teleported the player to
+    // their karma realm and overwrote birthRealm, with no death and no karma burn: a
+    // free rebirth and a way to reroll your realm.
     //
-    // Without this guard, walking out of the End teleported the player to their karma
-    // realm and overwrote birthRealm, with no death and no karma burn: a free rebirth
-    // and a way to reroll your realm.
-    var keepData = false
+    // KubeJS 7: PlayerRespawnedKubeEvent carries `endConquered` (isEndConquered()).
+    // There is no `keepData` any more -- reading it gives undefined, which is falsy, so
+    // the 1.20.1 guard would silently never fire. (Port doc 07, jar fact J13.)
+    var endReturn = false
     try {
-        keepData = event.keepData === true
+        endReturn = event.endConquered === true
     } catch (ignored) {
-        keepData = false
+        endReturn = false
     }
-    if (keepData) {
-        console.info('[Samsara] respawn with keepData (End return): not a rebirth, leaving player alone')
+    if (endReturn) {
+        console.info('[Samsara] respawn after the End (endConquered): not a rebirth, leaving player alone')
         return
     }
 
@@ -1027,12 +1056,12 @@ PlayerEvents.respawned(event => {
     // Apply the new realm's penalties NOW, immediately after writing birthRealm.
     //
     // We cannot rely on samsara_realms.js's own PlayerEvents.respawned handler for
-    // this: KubeJS loads server_scripts alphabetically, so samsara_realms.js
-    // registers BEFORE samsara_rebirth.js and therefore runs first -- it read the
-    // previous life's birthRealm and applied the wrong effects. That is why dying
-    // into naraka left the player on full health.
+    // this: samsara_realms.js loads BEFORE this file (priority 60 > 40, and it sorted
+    // first alphabetically on 1.20.1 too), so it runs first -- it would read the
+    // previous life's birthRealm and apply the wrong effects. That is why dying into
+    // naraka once left the player on full health.
     //
-    // Calling it here removes the dependency on file-name ordering entirely.
+    // Calling it here removes the dependency on load order entirely.
     try {
         global.SMS.applyRealmEffects(player)
     } catch (e) {
@@ -1066,7 +1095,9 @@ ServerEvents.commandRegistry(event => {
             .then(C.argument('realm', A.STRING.create(event))
                 .executes(ctx => {
                     const player = ctx.source.player
-                    const realm = A.STRING.getResult(ctx, 'realm')
+                    // Coerced: the argument is a Java String, which would miss every
+                    // JS key it is used to index.
+                    const realm = '' + A.STRING.getResult(ctx, 'realm')
                     const cfg = global.SMS.config
 
                     if (!global.SMS.isRealm(realm)) {
@@ -1099,11 +1130,7 @@ ServerEvents.commandRegistry(event => {
                         bx = Math.floor(bx / 8)
                         bz = Math.floor(bz / 8)
                     }
-                    try {
-                        level.getBlock(bx, anchor.y, bz).getChunk()
-                    } catch (ignored) {
-                        // best effort
-                    }
+                    loadChunkAt(level, bx, bz)
 
                     const found = findRebirthSpot(level, realm, { x: bx, y: anchor.y, z: bz }, dimId)
                     if (!found) {

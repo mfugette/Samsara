@@ -1,10 +1,19 @@
+// priority: 50
 // Samsara — Three Poisons / Three Antidotes: storage, rebirth routing, and the
 // events that change karma.
 //
-// Storage: stats are kept in the player's Forge "PlayerPersisted" NBT sub-tag.
-// That sub-tag is the one Forge copies to the new player entity on death, so values
-// survive both death and relog. The root persistentData does NOT survive death,
-// which is why we must use the sub-tag.
+// PRIORITY 50: this file's death handlers (endurance, delusion) must run BEFORE
+// samsara_rebirth.js's route + ripen (priority 40), because they read the PREVIOUS
+// death that ripening is about to overwrite. KubeJS 7 orders files by
+// `// priority: N` (higher first), then path -- not by file name alone.
+//
+// Storage: stats are kept in a "PlayerPersisted" sub-tag of player.persistentData.
+// On KubeJS 7 persistentData is KubeJS's OWN tag (saved as KubeJSPersistentData in
+// the entity NBT), and KubeJS copies the whole tag to the new player on every clone
+// -- death and End return alike -- so values survive death and relog. The sub-tag
+// is kept for continuity: it was what Forge copied on 1.20.1, and every key, the
+// harness and the migrations already live under it. Inspect it in game with
+// /data get entity @s KubeJSPersistentData.PlayerPersisted
 //
 // Stats are NON-NEGATIVE and capped at config.statCap. Routing works entirely on
 // SHARES of the total, so the absolute scale never matters -- only the balance.
@@ -15,7 +24,8 @@ const PERSISTED = 'PlayerPersisted'
 
 // Returns the live PlayerPersisted CompoundTag, creating it if missing.
 // getCompound() returns the live nested tag when present, or a fresh empty one when
-// absent; putting it back stores that reference so later writes persist.
+// absent; putting it back stores that reference so later writes persist. Never write
+// Samsara keys into player.forgePersistentData (NeoForge's tag): two stores, two truths.
 global.SMS.persistedTag = player => {
     const root = player.persistentData
     const sub = root.getCompound(PERSISTED)
@@ -148,6 +158,10 @@ global.SMS.derive = stats => {
 }
 
 // ---- Migration -------------------------------------------------------------
+
+// 1.21.1: no save carries pre-v3 data (the realms need a new world), so on this
+// version the three migrations find nothing, set their flags and log nothing. Kept
+// for the harness and as a record of the scale history.
 
 // v1: the original build stored one signed "samsara_karma" double.
 // Negative became hatred, positive became metta (what was then called virtue).
@@ -607,18 +621,19 @@ global.SMS.dimensionForRealm = (realm, stats, server) => {
 
 // villager | hostile | passive.
 //
-// isMonster() alone is not enough. It maps to vanilla's Monster/Enemy type, and
-// several mobs sit on the wrong side of that line for this mod's purposes:
+// The KubeJS helpers are MobCategory tests (read from the jar, identical in KubeJS 6
+// and 7): isMonster() is true only for MONSTER; isAnimal() for CREATURE *and* MISC --
+// villagers, golems, players; isWaterCreature / isAmbientCreature for their own
+// categories. Category alone puts some mobs on the wrong side for this mod:
 //
-//   - HOGLIN is an Animal in vanilla, so isMonster() is false. Killing hoglins for
-//     food -- a normal Nether activity -- was charging the passive rate for an
-//     animal that attacks on sight.
-//   - IRON GOLEM / SNOW GOLEM are neither Monster nor Animal, so they fell through
-//     to "passive" like a cow.
-//   - WANDERING TRADER is an NPC a player trades with, but it was not special-cased.
+//   - IRON GOLEM and WANDERING TRADER are MISC, so isAnimal() calls them animals.
+//     They are beings a player lives alongside, so the villager list claims them.
+//   - Hoglins, slimes and bosses are listed hostile so the verdict never depends on
+//     a modded category change.
 //
 // Explicit config lists are checked FIRST, then isMonster(), then the KubeJS animal
-// helpers, and only then the passive default.
+// helpers, and only then the passive default. A modded mob with an unusual category
+// (an Alex's Mobs predator in CREATURE, say) therefore classifies as passive.
 global.SMS.classifyVictim = victim => {
     const cfg = global.SMS.config
 
@@ -660,9 +675,11 @@ global.SMS.classifyVictim = victim => {
 // Is this entity tamed or named? Either makes it a being the player had a bond with,
 // so killing it is the heaviest animal kill in the game.
 //
-// There is no isTamed() on EntityKJS in this build, so read the NBT: vanilla stores
-// an `Owner` UUID on tameable mobs and `CustomName` on named ones.
-// IMPORTANT -- `Owner` IS NOT A STRING in 1.20.1.
+// Read from the NBT: vanilla stores an `Owner` UUID on tameable mobs and
+// `CustomName` on named ones. On 1.21.1 vanilla isTame() is callable too, but only
+// on TamableAnimal -- horses are AbstractHorse, with isTamed() instead -- and both
+// families save `Owner`, so the NBT test covers every tameable mob in one place.
+// IMPORTANT -- `Owner` IS NOT A STRING (1.20.1 and 1.21.1 alike).
 //
 // Vanilla's TamableAnimal writes the owner as a UUID, which serialises as an
 // INT_ARRAY tag (4 ints), not a string. `getString('Owner')` on an int-array
@@ -699,39 +716,10 @@ function isBondedAnimal(entity) {
     return false
 }
 
-// Diagnostic: dump an entity's tame-related NBT so the real shape is visible in the
-// log instead of being guessed at. Called from the tame queue when a check fails.
-// Costs nothing unless a tame candidate does not resolve.
-function describeTameNbt(entity) {
-    var parts = []
-    try {
-        var nbt = entity.nbt
-        if (!nbt) return 'nbt unreadable'
-        try {
-            parts.push('contains(Owner)=' + nbt.contains('Owner'))
-        } catch (e1) {
-            parts.push('contains() threw')
-        }
-        try {
-            parts.push("getString(Owner)='" + nbt.getString('Owner') + "'")
-        } catch (e2) {
-            parts.push('getString(Owner) threw')
-        }
-        try {
-            // Whole tag as a string is the surest way to see what is actually there.
-            parts.push('tag=' + ('' + nbt).slice(0, 300))
-        } catch (e3) {
-            parts.push('toString threw')
-        }
-    } catch (e) {
-        return 'nbt access threw: ' + e
-    }
-    return parts.join('  ')
-}
-
-// Is this a baby? Vanilla keeps a negative `Age` on young animals. There is no
-// isBaby() anywhere in this KubeJS build -- grepping the whole jar finds none, not
-// on EntityKJS, not on LivingEntityKJS, not as a @RemapForJS rename.
+// Is this a baby? Vanilla keeps a negative `Age` on young animals. getDouble reads
+// that INT tag correctly (CompoundTag.getDouble accepts any numeric tag -- read from
+// the jar). Vanilla isBaby() is callable on 1.21.1 as well; the NBT read is kept
+// because it is the path the harness and the 1.20.1 tests verified.
 function isBabyAnimal(entity) {
     try {
         var nbt = entity.nbt
@@ -747,7 +735,7 @@ function isBabyAnimal(entity) {
 
 // Resolve the player responsible for a death, or null.
 //
-// IMPORTANT (KubeJS 6 / Rhino): these are Java bean properties injected by
+// IMPORTANT (KubeJS 6 and 7 / Rhino): these are Java bean properties injected by
 // KubeJS's DamageSourceMixin (kjs$getPlayer, and @RemapForJS getActual /
 // getImmediate). They are only reachable with DOT notation. Bracket access
 // like source['player'] returns undefined -- Rhino does not route dynamic
@@ -949,13 +937,17 @@ EntityEvents.death(event => {
 })
 
 // Hurting a peaceful mob and leaving it alive still grows hatred -- the intention
-// was there. Guarded per entity so a single cow cannot be farmed by repeated hits,
-// and skipped entirely when the hit kills (EntityEvents.death charges the full rate).
-EntityEvents.hurt(event => {
-    const victim = event.entity
+// was there. Guarded per entity so a single cow cannot be farmed by repeated hits.
+//
+// Called from the ONE damage hook (global.SMS.onIncomingDamage, under endurance
+// below), which sees every swing at its raw damage, as 1.20.1's EntityEvents.hurt
+// did. KubeJS 7 has no EntityEvents.hurt -- and calling a missing event name throws
+// at load, which aborts the REST OF THIS FILE: every handler registered after it
+// would silently not exist.
+function hurtPassiveFrom(victim, source) {
     if (!victim || !victim.isLiving() || victim.isPlayer()) return
 
-    const attacker = global.SMS.resolveKiller(event.source)
+    const attacker = global.SMS.resolveKiller(source)
     if (!attacker) return
 
     // Only peaceful mobs: hitting hostiles is ordinary play and already priced
@@ -970,7 +962,7 @@ EntityEvents.hurt(event => {
     const r = global.SMS.award(attacker, 'hurtPassive')
     if (!r) return
     console.info(`[Samsara] ${attacker.profile.name} struck ${victim.type}: +${r.amount} ${r.stat} -> ${r.total}`)
-})
+}
 
 // ---- Greed: taking what was not given -------------------------------------
 //
@@ -989,10 +981,9 @@ const placedContainers = {}
 // net.minecraft.world.phys.AABB, loaded once at script load.
 //
 // getEntitiesWithin requires a real AABB (jar signature:
-// kjs$getEntitiesWithin(Lnet/minecraft/world/phys/AABB;)) and KubeJS 6 ships NO
-// AABB binding -- dev/latvian/mods/kubejs/bindings/ has BlockWrapper, ItemWrapper,
-// TextWrapper, KMath and friends, but nothing for AABB. So `AABB.of(...)` does not
-// exist and Java.loadClass is the only route.
+// kjs$getEntitiesWithin(Lnet/minecraft/world/phys/AABB;)). KubeJS 6 shipped no AABB
+// binding, so Java.loadClass was the only route; KubeJS 7 adds `AABB.of(...)`, but
+// the loaded class works on both and is what the harness models.
 //
 // Loaded at load time rather than per-call: Java.loadClass is not free, and the
 // broken-block hook can fire many times a second while a player mines.
@@ -1006,7 +997,8 @@ try {
 // Is a villager-class being within villagerBlockRadius of x/y/z?
 // Returns null when it cannot tell, so callers can decline to charge on a guess.
 //
-// BlockContainerJS has NO collision API and no bounding box -- verified in the jar.
+// The block wrapper (BlockContainerJS on KubeJS 6, LevelBlock on 7) has no bounding
+// box -- verified in both jars.
 // The search box is built from the block's own x/y/z with the 6-double AABB
 // constructor. getEntitiesWithin returns a Java List (EntityArrayList), not a JS
 // array: Java 21's getFirst() is NOT available on it under Rhino, so size()/get(i).
@@ -1027,10 +1019,10 @@ function villagerNear(level, x, y, z) {
     }
 }
 
-// Position key for a BlockContainerJS.
+// Position key for a block wrapper (LevelBlock on KubeJS 7).
 //
-// BlockContainerJS exposes getX/getY/getZ and getDimension directly (verified in
-// the jar) -- there is no `.pos` bean to destructure, and no collision API at all.
+// It exposes getX/getY/getZ and getDimension directly (verified in both jars), so
+// `block.dimension` / `.x` / `.y` / `.z` are beans; no collision API at all.
 // getDimension returns the dimension ResourceLocation, which is what makes this key
 // unique across realms sharing coordinates (human and animal both use the
 // Overworld, but naraka at 0,18,0 must not collide with it).
@@ -1064,10 +1056,15 @@ BlockEvents.placed(event => {
     }
 })
 
-// ChestEventJS.getBlock() is @Nullable -- verified in the jar. A chest opened
+// The chest event's getBlock() is @Nullable -- verified in both jars. A chest opened
 // through anything other than a world block (an ender chest, a mod's portable
 // inventory, a minecart chest) has no block at all, so the null case is normal and
 // must fail open rather than charge greed on a guess.
+//
+// KNOWN LIMIT (KubeJS 6 and 7 alike): chestOpened fires only for a ChestMenu, and
+// getBlock() is non-null only when the menu's container is a block entity. Single
+// chests and barrels charge; DOUBLE chests (a CompoundContainer), shulker boxes,
+// hoppers and modded menus never do.
 PlayerEvents.chestOpened(event => {
     const player = event.player
     if (!player) return
@@ -1092,7 +1089,7 @@ PlayerEvents.chestOpened(event => {
     if (placer) {
         owner = 'another player'
     } else {
-        // Jar-verified: BlockContainerJS.getLevel().
+        // Jar-verified: the block wrapper's getLevel().
         var village = null
         try {
             village = villagerNear(block.level, block.x, block.y, block.z)
@@ -1172,16 +1169,16 @@ function feedRateRecord(player) {
 // Feeding is GIVING. AN 3.57: even throwing the rinsings of a bowl into a pool for
 // the creatures living there "would be a source of merit".
 //
-// Verified present in this build: ItemEntityInteractedEventJS exposes player,
-// entity (getTarget), hand and getItem. Feeding was verified in game 2026-10-18
+// Verified present in both builds: the entity-interacted event exposes player,
+// entity, target, hand and item (ItemEntityInteractedEventJS on KubeJS 6,
+// ItemEntityInteractedKubeEvent on 7). Feeding was verified in game 2026-10-18
 // (then as metta).
 ItemEvents.entityInteracted(event => {
     // CAREFUL: on THIS event, `entity` is the PLAYER and `target` is the animal.
     //
-    // ItemEntityInteractedEventJS extends PlayerEventJS, so it inherits
-    // getEntity() -> the player ("The player that interacted with the entity"), and
-    // adds getTarget() -> "The entity that was interacted with". Both strings are in
-    // the jar verbatim.
+    // The event is a player event, so getEntity() is the player ("The player that
+    // interacted with the entity"), and getTarget() is "The entity that was
+    // interacted with". Both strings are in the jar verbatim, on 6 and 7.
     //
     // This is the OPPOSITE of every other handler in this file, where event.entity
     // is the mob (EntityEvents.death/hurt) or the actor (BlockEvents.placed/broken).
@@ -1192,9 +1189,10 @@ ItemEvents.entityInteracted(event => {
     const target = event.target
     if (!player || !target) return
 
-    // isAnimal() maps to vanilla's Animal type, but its implementation could not be
-    // located in the jar, so its semantics here are UNVERIFIED. The explicit list
-    // backs it up so feeding does not fail closed on a predicate we cannot read.
+    // isAnimal() is KubeJS's MobCategory test: CREATURE *and* MISC (read from the
+    // jar). So feeding a villager or an iron golem bread pays generosity too --
+    // pre-existing on 1.20.1, a design question, not changed by the port. The
+    // explicit list backs isAnimal() up for modded tameables in other categories.
     var saysAnimal = false
     try {
         saysAnimal = target.isAnimal() === true
@@ -1333,7 +1331,8 @@ function settleEncounter(player, enc, how, isDeath) {
 
     // A death inside the ripening cooldown is a rapid repeat. lastDeathTick still
     // holds the PREVIOUS death here: ripening (samsara_rebirth.js) writes it, and
-    // that handler registers after this file's.
+    // that file's priority (40) is below this one's (50), so its death handler runs
+    // after this one.
     if (isDeath && end.blockRapidDeath) {
         var last = Number(tag.getDouble(cfg.nbt.lastDeathTick))
         var since = now - last
@@ -1458,26 +1457,34 @@ global.SMS.endurance = {
 
 // Tag spawner-born mobs so they can never open an encounter.
 //
-// Jar-verified: CheckLivingEntitySpawnEventJS.getSpawner() -- "The spawner that
-// spawned the entity. Can be null if the entity was spawned by worldgen." The event
-// fires only for BaseSpawner and worldgen spawns, so non-null means a spawner.
+// KubeJS 7: checkSpawn is NeoForge's FinalizeSpawnEvent -- it fires for natural
+// spawns, spawn eggs, /summon, breeding and conversion too -- and event.spawner is
+// NEVER null (WrappedSpawner.of(null) returns WrappedSpawner(null, null)), so its
+// truthiness says nothing. On 1.20.1 it was null for natural spawns; ported as
+// written, every mob would carry the mark and endurance would never pay. Decide by
+// event.type, the MobSpawnType (its toString() is the enum name, e.g. 'SPAWNER').
+//
+// Never cancel this event: it would cancel the spawn.
 EntityEvents.checkSpawn(event => {
-    if (!global.SMS.config.endurance.ignoreSpawnerMobs) return
+    const end = global.SMS.config.endurance
+    if (!end.ignoreSpawnerMobs) return
+    var type = ''
     try {
-        if (event.spawner) event.entity.persistentData.putBoolean(SPAWNER_MARK, true)
+        type = '' + event.type
     } catch (ignored) {
+        type = ''
+    }
+    if ((end.spawnerSpawnTypes || []).indexOf(type) === -1) return
+    try {
+        event.entity.persistentData.putBoolean(SPAWNER_MARK, true)
+    } catch (ignored2) {
         // cannot tag it: it will count as natural, which only loosens one guard
     }
 })
 
-// Both halves of an encounter come through the hurt event.
-//
-// Jar-verified: LivingEntityHurtEventJS.getDamage() -- "The amount of damage."
-// (a float, which Rhino coerces; only Java long is the trap).
-EntityEvents.hurt(event => {
-    const victim = event.entity
+// Both halves of an encounter come through the damage hook below.
+function enduranceFrom(victim, source, amount) {
     if (!victim) return
-    const source = event.source
 
     // 1. Violence: a real player struck a living thing (not themselves).
     var striker = null
@@ -1504,17 +1511,59 @@ EntityEvents.hurt(event => {
     } catch (ignored) {
         return
     }
-    var dmg = 0
-    try {
-        dmg = Number(event.damage)
-    } catch (ignored) {
-        dmg = 0
-    }
+    var dmg = Number(amount)
+    if (!isFinite(dmg)) dmg = 0
     global.SMS.endurance.onThreat(victim, attacker, dmg)
-})
+}
 
-// Close quiet encounters. Same queue-and-drain pattern the tame check used (project
-// trap 10: scheduleInTicks is unusable here).
+// ---- THE damage hook: one listener, one meaning of "was hurt" --------------
+//
+// NeoForge's LivingIncomingDamageEvent: the first thing LivingEntity.hurt() does,
+// with the RAW damage -- before the shield, invulnerability frames and armor. That
+// is exactly what KubeJS 6's EntityEvents.hurt was on 1.20.1 (Architectury
+// LIVING_HURT = Forge LivingAttackEvent), so endurance's minDamage, hurtPassive's
+// "every swing counts" and every harness timeline keep their meaning. KubeJS 7's
+// own beforeHurt/afterHurt are LivingDamageEvent.Pre/Post: AFTER armor, which would
+// make an iron-armoured player need twice the hits to reach minDamage.
+// (Port doc 05; jar facts J9, J32.)
+//
+// The two consumers write different state, so their order does not matter; they
+// live in one place so there is exactly one damage source in the pack.
+global.SMS.onIncomingDamage = (victim, source, amount) => {
+    hurtPassiveFrom(victim, source)
+    enduranceFrom(victim, source, amount)
+}
+
+// Registered through NativeEvents, which puts the listener on NeoForge.EVENT_BUS.
+// Explicit getters, not beans: this is a NeoForge object, not a KubeJS event.
+//
+// /reload: KubeJS's ScriptManager.reload() calls unload(), which clears every
+// script's native listeners before the scripts run again (read from the jar,
+// build 377), so this cannot double up across reloads.
+//
+// SAMSARA ONLY OBSERVES DAMAGE: never cancel this event or setAmount on it. The
+// try/catch is safe here -- there is no KubeJS EventExit on a native event to
+// swallow (that trap is about event.cancel() on KubeJS events).
+//
+// The REGISTRATION is in a try too: a top-level throw here (the class not loading,
+// NativeEvents missing) would abort the rest of this file -- the encounter drain, the
+// endurance death hook and delusion -- exactly as EntityEvents.hurt would have. Lose
+// the damage hook loudly instead, and keep the rest.
+try {
+    NativeEvents.onEvent(Java.loadClass('net.neoforged.neoforge.event.entity.living.LivingIncomingDamageEvent'), event => {
+        try {
+            global.SMS.onIncomingDamage(event.getEntity(), event.getSource(), Number(event.getAmount()))
+        } catch (e) {
+            console.warn(`[Samsara] incoming-damage hook failed: ${e}`)
+        }
+    })
+} catch (e) {
+    console.error(`[Samsara] could not register the damage hook -- hurtPassive and endurance are OFF: ${e}`)
+}
+
+// Close quiet encounters. The queue-and-drain pattern is kept on KubeJS 7: it is
+// proven, driven by the harness, and survives /reload (scheduleInTicks was
+// unusable on KubeJS 6).
 ServerEvents.tick(event => {
     if (Object.keys(global.SMS.encounters).length === 0) return
     global.SMS.endurance.drain(event.server.players)
@@ -1543,8 +1592,8 @@ EntityEvents.death(event => {
 // Repeat deaths inside the ripening cooldown charge more: the first careless death
 // is an accident, the fifth in five minutes is a pattern. The streak counter is the
 // same one ripening uses, read BEFORE ripening updates it (handler order within the
-// same event is registration order, and samsara_karma.js loads before
-// samsara_rebirth.js alphabetically).
+// same event is registration order, and this file's `// priority: 50` loads it
+// before samsara_rebirth.js's 40).
 //
 // BOUNDED PER BURST. The first repeat pays the full repeatDeath; each later one in
 // the same unbroken run pays repeatFalloff times the one before (5, 1.75, 0.61,

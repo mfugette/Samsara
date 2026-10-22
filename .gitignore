@@ -39,6 +39,10 @@
 /kubejs/cache/
 /kubejs/exported/
 
+# KubeJS 7's local web server config holds an AUTH TOKEN for that server. A secret,
+# and machine-local: never commit it. (client.json / common.json are plain settings.)
+/kubejs/config/web_server.json
+
 # Agent scratch state: per-session transcripts, local settings, tool caches.
 # settings.local.json is explicitly the "not shared" settings file.
 

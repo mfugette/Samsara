@@ -1,4 +1,6 @@
-// Samsara — commands.
+// priority: 0
+// Samsara — commands. (Priority 0: no ordering dependency; everything is read at
+// command time.)
 //   /karma                               your six stats, derived values and verdict
 //   /karma show <player>                 inspect another player     (op, level 2)
 //   /karma set <player> <stat> <value>   set one stat               (op, level 2)
@@ -20,11 +22,11 @@ ServerEvents.commandRegistry(event => {
     const C = event.commands // net.minecraft.commands.Commands
     const A = event.arguments // KubeJS ArgumentTypeWrappers (PLAYER, INTEGER, STRING, ...)
 
-    // KubeJS adds a non-lazy sendSuccess(Component, boolean) overload. The vanilla
-    // 1.20.1 signature takes a Supplier<Component>, and Rhino will NOT coerce a JS
-    // arrow function into that Supplier -- it stringifies it instead, which is why
-    // `/karma` once printed "ArrowFunction (0) => {...}" in chat. Pass the Component
-    // directly.
+    // KubeJS adds a non-lazy sendSuccess(Component, boolean) overload (KubeJS 6 and 7).
+    // The vanilla signature takes a Supplier<Component>, and on 1.20.1 Rhino did NOT
+    // coerce a JS arrow function into that Supplier -- it stringified it instead, which
+    // is why `/karma` once printed "ArrowFunction (0) => {...}" in chat. Pass the
+    // Component directly.
     const reply = (ctx, component) => {
         ctx.source.sendSuccess(component, false)
         return 1
@@ -296,7 +298,9 @@ ServerEvents.commandRegistry(event => {
                     .then(C.argument('realm', A.STRING.create(event))
                         .executes(ctx => {
                             const target = A.PLAYER.getResult(ctx, 'target')
-                            const realm = A.STRING.getResult(ctx, 'realm')
+                            // Coerced, as `liberate` does: a Java String compared with
+                            // === against a JS literal is false.
+                            const realm = '' + A.STRING.getResult(ctx, 'realm')
                             const key = global.SMS.config.nbt.forcedRealm
 
                             if (realm === 'none' || realm === 'clear') {
