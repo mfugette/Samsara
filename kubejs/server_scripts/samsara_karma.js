@@ -18,8 +18,6 @@
 // Stats are NON-NEGATIVE and capped at config.statCap. Routing works entirely on
 // SHARES of the total, so the absolute scale never matters -- only the balance.
 
-global.SMS = global.SMS || {}
-
 const PERSISTED = 'PlayerPersisted'
 
 // Returns the live PlayerPersisted CompoundTag, creating it if missing.
@@ -617,6 +615,51 @@ global.SMS.dimensionForRealm = (realm, stats, server) => {
     return cfg.realmDimensions[realmKey] || cfg.realmDimensions.human
 }
 
+// ---- The animal body: its diet follows the karma --------------------------------
+//
+// Which creature an animal birth is drawn as (config.animalBirth). Worse karma, a
+// carnivore: the diet is the first tier whose minNet <= Net, tiers listed gentlest
+// first. Pure -- no player, no world -- so the same numbers that routed the birth
+// decide it, and the harness can pin the boundaries. `seed` (any string) picks the
+// creature inside the tier; the same seed always gives the same creature.
+//
+// Returns { diet, form }, or null when no tier has a creature for this Net.
+//
+// codePointAt, NEVER charCodeAt (N12): on Rhino 2101 charCodeAt returns a raw
+// java.lang.Character, so `h * 31 + s.charCodeAt(i)` is NaN -- and even `typeof` on it
+// throws. That made every index NaN and gave every animal birth an undefined body in
+// the first in-game test (2026-10-22). Probed against the installed Rhino jar:
+// codePointAt returns a number. Node returns a number for both, so only the harness
+// lint can catch a charCodeAt offline.
+function animalSeedIndex(seed, n) {
+    var h = 7
+    for (var i = 0; i < seed.length; i++) h = (h * 31 + seed.codePointAt(i)) % 2147483647
+    return h % n
+}
+
+global.SMS.animalFormFor = (stats, seed) => {
+    const tiers = (global.SMS.config.animalBirth || {}).tiers || []
+    const net = global.SMS.derive(stats).net
+    for (var i = 0; i < tiers.length; i++) {
+        var tier = tiers[i]
+        if (net >= tier.minNet && tier.forms.length > 0) {
+            return { diet: tier.diet, form: tier.forms[animalSeedIndex('' + seed, tier.forms.length)] }
+        }
+    }
+    return null
+}
+
+// The diet of a configured creature, or null for anything not in a tier -- which is
+// also how a stored body that has since been removed from the config is recognised.
+global.SMS.animalDietOf = form => {
+    const key = form ? '' + form : ''
+    const tiers = (global.SMS.config.animalBirth || {}).tiers || []
+    for (var i = 0; i < tiers.length; i++) {
+        if (tiers[i].forms.indexOf(key) !== -1) return tiers[i].diet
+    }
+    return null
+}
+
 // ---- Victim classification -------------------------------------------------
 
 // villager | hostile | passive.
@@ -795,15 +838,34 @@ global.SMS.resolveKiller = source => {
 
 // ---- Award -----------------------------------------------------------------
 
+// An animal-born player's own killing is free (config.animalBirth.freeActs).
+function freeForAnimal(player, act) {
+    const free = (global.SMS.config.animalBirth || {}).freeActs || []
+    if (free.indexOf(act) === -1) return false
+    try {
+        return global.SMS.birthRealmOf(player) === 'animal'
+    } catch (ignored) {
+        return false
+    }
+}
+
 // Award an act by name, reading both its value and its target stat from config.
 // `amountOverride` replaces the configured value (hostile kills use it for their
 // per-life tiers); the stat always comes from config.
+//
+// The animal exemption is checked HERE, at the one seam every hook goes through, so
+// no hook can forget it. It returns null like any unpaid act, which every caller
+// already reads as "nothing happened".
 global.SMS.award = (player, act, amountOverride) => {
     const cfg = global.SMS.config
     const amount = amountOverride !== undefined ? amountOverride : cfg.karma[act]
     const stat = cfg.karmaStat[act]
     if (amount === undefined || !stat) {
         console.warn(`[Samsara] unknown karma act '${act}'`)
+        return null
+    }
+    if (freeForAnimal(player, act)) {
+        console.info(`[Samsara] ${player.profile.name}: ${act} is free (born animal)`)
         return null
     }
     global.SMS.ensureMigrated(player)
@@ -1308,6 +1370,22 @@ global.SMS.resetLifeCounters = player => {
     const tag = global.SMS.persistedTag(player)
     tag.putDouble(nbt.lifeHostileKills, 0)
     tag.putDouble(nbt.lifeEndured, 0)
+    // A preta's clock belongs to that life (samsara_realms.js starts a fresh one at the
+    // next preta birth). Without this, a preta that died some other way -- the void,
+    // /kill -- would carry the leftover minutes into its next preta life.
+    tag.putDouble(nbt.pretaLife, 0)
+    tag.putDouble(nbt.pretaHalveArmed, 0)
+}
+
+// Is this death a rapid repeat -- inside ripening.cooldownTicks of the previous one?
+// lastDeathTick still holds the PREVIOUS death while karma's death handlers run:
+// ripening (samsara_rebirth.js) writes it, and that file's priority (40) is below this
+// one's (50), so its death handler runs after these.
+function deathInsideCooldown(player) {
+    const cfg = global.SMS.config
+    const tag = global.SMS.persistedTag(player)
+    var since = (global.SMS.tickClock || 0) - Number(tag.getDouble(cfg.nbt.lastDeathTick))
+    return tag.getBoolean(cfg.nbt.everDied) && since >= 0 && since < cfg.ripening.cooldownTicks
 }
 
 // Decide whether a closed encounter pays, and pay it. Returns the award or null.
@@ -1327,19 +1405,11 @@ function settleEncounter(player, enc, how, isDeath) {
     if (global.SMS.isLiberated(player)) return null
 
     const tag = global.SMS.persistedTag(player)
-    const now = global.SMS.tickClock || 0
 
-    // A death inside the ripening cooldown is a rapid repeat. lastDeathTick still
-    // holds the PREVIOUS death here: ripening (samsara_rebirth.js) writes it, and
-    // that file's priority (40) is below this one's (50), so its death handler runs
-    // after this one.
-    if (isDeath && end.blockRapidDeath) {
-        var last = Number(tag.getDouble(cfg.nbt.lastDeathTick))
-        var since = now - last
-        if (tag.getBoolean(cfg.nbt.everDied) && since >= 0 && since < cfg.ripening.cooldownTicks) {
-            enduranceLog(`${name} ${how}: rapid repeat death -- nothing`)
-            return null
-        }
+    // A death inside the ripening cooldown is a rapid repeat (see deathInsideCooldown).
+    if (isDeath && end.blockRapidDeath && deathInsideCooldown(player)) {
+        enduranceLog(`${name} ${how}: rapid repeat death -- nothing`)
+        return null
     }
 
     // Aggregate bound, checked BEFORE the window: alreadyPaid records a payment
@@ -1569,10 +1639,83 @@ ServerEvents.tick(event => {
     global.SMS.endurance.drain(event.server.players)
 })
 
-// A death settles the dying life's encounter and resets the per-life counters.
+// ---- Generosity: the offering of the body (herbivore births) ----------------
+//
+// A herbivore-born player killed by a predator, having struck nothing in the
+// endurance.quietTicks before, gives its body: karma.offerBody (generosity). See
+// config.animalBirth.offering for the doctrine and what counts as a predator.
+//
+// It reads global.SMS.lastViolence -- the same "struck a living thing" record
+// endurance keeps -- so it MUST run before endurance.onDeath, which deletes it. Both
+// run from the one death handler below, in that named order.
+
+// The predator behind this death, or null: a real player wearing a body of a
+// predator diet, or a mob that is a listed predator or a creature of such a diet.
+function predatorOf(source, off) {
+    var diets = off.predatorDiets || []
+    var killer = global.SMS.resolveKiller(source)
+    if (killer) {
+        if (global.SMS.birthRealmOf(killer) !== 'animal') return null
+        var killerDiet = global.SMS.animalDietOf(global.SMS.nbtString(global.SMS.persistedTag(killer), global.SMS.config.nbt.animalForm))
+        return diets.indexOf('' + killerDiet) !== -1 ? killer : null
+    }
+    var actual = null
+    try {
+        actual = source.actual
+        if (!actual || !actual.isLiving()) return null
+    } catch (ignored) {
+        return null
+    }
+    var type = '' + actual.type
+    if ((off.predators || []).indexOf(type) !== -1) return actual
+    return diets.indexOf('' + global.SMS.animalDietOf(type)) !== -1 ? actual : null
+}
+
+global.SMS.offering = {
+    // `player` died from `source`. Returns the award, or null.
+    onDeath: (player, source) => {
+        const cfg = global.SMS.config
+        const off = (cfg.animalBirth || {}).offering
+        if (!off || !source) return null
+        if (global.SMS.isLiberated(player)) return null
+        if (global.SMS.birthRealmOf(player) !== 'animal') return null
+        const diet = global.SMS.animalDietOf(global.SMS.nbtString(global.SMS.persistedTag(player), cfg.nbt.animalForm))
+        if ((off.diets || []).indexOf('' + diet) === -1) return null
+
+        const predator = predatorOf(source, off)
+        if (!predator) return null
+        const name = player.profile.name
+
+        // An offering is given, not lost: any strike in the quiet window before
+        // the death makes it a fight.
+        const lastV = global.SMS.lastViolence[playerKey(player)]
+        const since = (global.SMS.tickClock || 0) - lastV
+        if (lastV !== undefined && since >= 0 && since < cfg.endurance.quietTicks) {
+            console.info(`[Samsara] ${name} fought ${predator.type} -- not an offering`)
+            return null
+        }
+        if (off.blockRapidDeath && deathInsideCooldown(player)) {
+            console.info(`[Samsara] ${name}: offering inside the rapid-death window -- nothing`)
+            return null
+        }
+
+        const r = global.SMS.award(player, 'offerBody')
+        if (!r) return null
+        console.info(`[Samsara] ${name} (${diet}) gave its body to ${predator.type}: +${fmt(r.amount)} ${r.stat} -> ${fmt(r.total)}`)
+        return r
+    },
+}
+
+// A death settles the dying life: first the offering (it reads lastViolence), then
+// the encounter and the per-life counters (endurance.onDeath clears lastViolence).
 EntityEvents.death(event => {
     const player = event.entity
     if (!player || !player.isPlayer()) return
+    try {
+        global.SMS.offering.onDeath(player, event.source)
+    } catch (e) {
+        console.warn(`[Samsara] offering death hook failed: ${e}`)
+    }
     try {
         global.SMS.endurance.onDeath(player)
     } catch (e) {
@@ -1606,6 +1749,9 @@ EntityEvents.death(event => {
 EntityEvents.death(event => {
     const player = event.entity
     if (!player || !player.isPlayer()) return
+
+    // (A preta whose craving is spent no longer dies -- it becomes human again,
+    // samsara_realms.js -- so there is no "life ran its course" death to exempt here.)
 
     // Was anyone responsible? If a mob or player killed them, this is not
     // carelessness -- it is the ordinary risk of the world.

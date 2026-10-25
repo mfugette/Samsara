@@ -16,8 +16,6 @@
 // NOTE: a NEW subcommand needs a world REJOIN, not just /reload -- the client caches
 // its command tree, so `liberate` will not appear until the world is reopened.
 
-global.SMS = global.SMS || {}
-
 ServerEvents.commandRegistry(event => {
     const C = event.commands // net.minecraft.commands.Commands
     const A = event.arguments // KubeJS ArgumentTypeWrappers (PLAYER, INTEGER, STRING, ...)
@@ -141,8 +139,30 @@ ServerEvents.commandRegistry(event => {
         // Where they live now, and what that costs them.
         const born = global.SMS.birthRealmOf(player)
         const fx = global.SMS.effectsFor(born)
-        const fxNote = Object.keys(fx).length === 0 ? 'no penalties' : JSON.stringify(fx)
-        reply(ctx, Text.yellow(`  born into: ${born}  (${fxNote})`))
+        reply(ctx, Text.yellow(`  born into: ${born}  (${global.SMS.describeEffects(fx)})`))
+
+        // The creature an animal birth is drawn as, and the diet its karma gave it.
+        const ptag = global.SMS.persistedTag(player)
+        const bodyForm = global.SMS.nbtString(ptag, cfg.nbt.animalForm)
+        if (born === 'animal' && bodyForm) {
+            reply(ctx, Text.yellow(`  body: ${bodyForm}  (${global.SMS.animalDietOf(bodyForm) || 'no longer in config'})`))
+        }
+
+        // What is left of a preta life, and whether a full belly would halve it now.
+        const lifeLeft = Number(ptag.getDouble(cfg.nbt.pretaLife))
+        if (born === 'preta' && lifeLeft > 0) {
+            var armed = ptag.getDouble(cfg.nbt.pretaHalveArmed) > 0
+            reply(ctx, Text.yellow(
+                `  preta life: ${global.SMS.minutesSeconds(lifeLeft)} left` +
+                    (armed ? '  (a full belly now halves it)' : '  (a full belly halves it, once you have gone hungry)')
+            ))
+        }
+
+        // Grave keys Samsara keeps outside a human life (samsara_tombstone.js).
+        const keysKept = global.SMS.graves ? global.SMS.graves.keysKept(player) : 0
+        if (keysKept > 0) {
+            reply(ctx, Text.yellow(`  grave keys kept by Samsara: ${keysKept}  (yours again in a human life)`))
+        }
 
         // Already out of the cycle?
         if (global.SMS.isLiberated(player)) {
@@ -276,11 +296,16 @@ ServerEvents.commandRegistry(event => {
                             }
 
                             global.SMS.persistedTag(target).putString(global.SMS.config.nbt.birthRealm, realm)
+                            // A new birth, so a new body (applyRealmEffects picks one
+                            // from the stats as they are now when the realm is animal)
+                            // and a fresh preta clock.
+                            global.SMS.persistedTag(target).putString(global.SMS.config.nbt.animalForm, '')
+                            global.SMS.persistedTag(target).putDouble(global.SMS.config.nbt.pretaLife, 0)
                             global.SMS.applyRealmEffects(target)
+                            global.SMS.tellBirthRules(target)
 
                             const fx = global.SMS.effectsFor(realm)
-                            const desc = Object.keys(fx).length === 0 ? 'no penalties yet' : JSON.stringify(fx)
-                            return reply(ctx, Text.green(`${target.profile.name} is now born-${realm} (${desc})`))
+                            return reply(ctx, Text.green(`${target.profile.name} is now born-${realm} (${global.SMS.describeEffects(fx)})`))
                         }))))
             // /karma forcerealm <player> <realm|none> — override WHERE THE PLAYER IS
             // REBORN on their NEXT DEATH.
@@ -342,6 +367,8 @@ ServerEvents.commandRegistry(event => {
 
                             if (state === 'off' || state === 'false' || state === 'none') {
                                 global.SMS.persistedTag(target).putBoolean(global.SMS.config.nbt.liberated, false)
+                                // Back under the birth realm's rules at once (body, mode).
+                                global.SMS.applyRealmEffects(target)
                                 return reply(ctx, Text.yellow(`${target.profile.name} is back in the cycle`))
                             }
 
@@ -396,8 +423,10 @@ ServerEvents.commandRegistry(event => {
                         tag.putBoolean(nbt.migratedV2, true)
                         tag.putBoolean(nbt.migratedV3, true)
 
-                        // 5. Back to a human birth, and strip the old realm's effects.
+                        // 5. Back to a human birth in the player's own body, and strip
+                        //    the old realm's effects.
                         tag.putString(nbt.birthRealm, 'human')
+                        tag.putString(nbt.animalForm, '')
                         try {
                             global.SMS.applyRealmEffects(target)
                         } catch (e) {
@@ -408,7 +437,7 @@ ServerEvents.commandRegistry(event => {
                         reply(ctx, Text.green(`${target.profile.name}'s karma reset to baseline`))
                         return reply(
                             ctx,
-                            Text.gray('  six stats 0, born human, forcerealm/liberated cleared, death streak + life counters reset')
+                            Text.gray('  six stats 0, born human in their own body, forcerealm/liberated cleared, death streak + life counters reset')
                         )
                     })))
             .then(C.literal('show')

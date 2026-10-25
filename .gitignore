@@ -32,6 +32,31 @@
 # brief; the notes folder holds the design docs, the session handoff, and the offline
 # test harness (test_routing.js), all of which are source.
 
+# The ONE load-bearing mod config. Woodwalkers draws an animal-born player as their
+# creature, and "apiLevel": 0 (API_ONLY) is what stops any player from unlocking or
+# switching bodies with its keys (the project notes, realm penalties). It is CraftedCore's
+# json5, not a NeoForge toml, so defaultconfigs/ does not apply: whitelisted in
+# place. samsara_realms.js warns at load if the level is anything else.
+!/config/
+/config/*
+!/config/walkers.json5
+
+# Corail Tombstone, cut down to the grave and its key (decided 2026-10-22): its three
+# tomls switch the rest off -- the respawn Ghostly Shape (whose tick refills the food
+# bar a preta lives by), enchantments, potions, magic items, alignment, sieges, events
+# -- and activate_grave_by_sneaking = false closes the one way into a grave Samsara has
+# no event to refuse. Its loot pools are emptied, so nothing of it reaches chests or
+# drops. samsara_tombstone.js does the rest (only humans have graves).
+!/config/tombstone-server.toml
+!/config/tombstone-common.toml
+!/config/tombstone-client.toml
+!/config/tombstone/
+/config/tombstone/*
+!/config/tombstone/loottables/
+
+# SparseStructures: Tombstone's abandoned graves set to factor 0 (off).
+!/config/sparsestructures.json5
+
 # 3. Re-ignore things that live INSIDE the whitelisted trees.
 
 # KubeJS writes its Mojang-mapping remapper cache and generated output here.
@@ -65,12 +90,10 @@ desktop.ini
 #                          blobs in git are not how you distribute them. Also
 #                          the project notes require asking before changing mods, and
 #                          tracking them invites silent changes.
-#   config/                Game-GENERATED per-mod tomls, rewritten on launch
-#                          (it currently holds leftovers for Aether, Twilight
-#                          Forest and Undergarden -- mods that are not even
-#                          installed). Not source. If a config ever becomes
-#                          load-bearing for the pack, it belongs in
-#                          defaultconfigs/ and should be whitelisted then.
+#   config/                Game-GENERATED per-mod tomls, rewritten on launch. Not
+#                          source -- except the few load-bearing ones whitelisted
+#                          above (Woodwalkers, Tombstone, SparseStructures).
+#                          Leftovers of removed mods were deleted 2026-10-22.
 #   logs/, crash-reports/  Runtime output. Read constantly during testing --
 #                          the project notes require checking logs/latest.log after
 #                          every in-game test -- but never a source artifact.

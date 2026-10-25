@@ -28,8 +28,6 @@
 //
 // See HANDOFF.md section 6 for the history this replaces.
 
-global.SMS = global.SMS || {}
-
 // ---- What counts as ground, clear space, and danger -------------------------
 
 // Blocks that are solid but must never be stood on or in.
@@ -323,6 +321,24 @@ function spiralSearch(level, bx, bz, radius, yFrom, yTo, skyMode, budget) {
 // a cached spot that has since been griefed or changed is discarded.
 global.SMS.spawnCache = global.SMS.spawnCache || {}
 
+// The cache key carries the ANCHOR column, not just the realm: a birth at its grave
+// (graveAnchor) has a different anchor per player, and keyed by realm alone the next
+// preta would have been born at the first one's grave.
+function spawnCacheKey(realm, dimId, anchor) {
+    return realm + '@' + dimId + '@' + anchor.x + ',' + anchor.z
+}
+
+// Drop entries past cacheTicks, so per-player grave anchors cannot pile up.
+function pruneSpawnCache() {
+    const ttl = global.SMS.config.safeSpawn.cacheTicks
+    const now = global.SMS.tickClock || 0
+    const keys = Object.keys(global.SMS.spawnCache)
+    for (var i = 0; i < keys.length; i++) {
+        var age = now - global.SMS.spawnCache[keys[i]].at
+        if (age < 0 || age >= ttl) delete global.SMS.spawnCache[keys[i]]
+    }
+}
+
 // Find a rebirth spot in `level` for `realm`, or null if genuinely nothing exists.
 //
 // Strategy, cheapest and most-correct first:
@@ -591,11 +607,56 @@ function findRebirthSpot(level, realm, anchor, dimId) {
 
 // ---- Anchor ----------------------------------------------------------------
 
-// Where to search around. Rebirth means losing your place in the world, so this is
-// always the realm's configured spawn -- never the death position, which made a
-// same-realm death indistinguishable from a vanilla respawn.
+// The last HUMAN death (config.nbt.humanDeath*): where Tombstone leaves the grave, and
+// where a realm in config.graves.bornAtGrave is born. Recorded by the death handler below,
+// from the DYING life's birthRealm -- the respawn handler writes the new one only later.
+// Overwritten only by the next human death, so it survives any number of other births.
+// Explicit vanilla getters (N9): getX/Y/Z, level().dimension().location().
+global.SMS.recordHumanDeath = player => {
+    if (global.SMS.birthRealmOf(player) !== 'human') return false
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    tag.putDouble(nbt.humanDeathX, Math.floor(Number(player.getX())))
+    tag.putDouble(nbt.humanDeathY, Math.floor(Number(player.getY())))
+    tag.putDouble(nbt.humanDeathZ, Math.floor(Number(player.getZ())))
+    tag.putString(nbt.humanDeathDim, '' + player.level().dimension().location())
+    tag.putBoolean(nbt.humanDeathSet, true)
+    return true
+}
+
+// Where a birth into `realm` is anchored when it is born at its grave: the last human
+// death, if `realm` is in config.graves.bornAtGrave and that death was in the realm's own
+// dimension (a preta haunts the human world, so a human who last died in the Nether
+// leaves nothing in the Overworld to haunt). Otherwise null. Pretas haunt "their old
+// homes" (Khp 7, the Tirokudda; design doc 7.4).
+global.SMS.graveAnchor = (player, realm) => {
+    const cfg = global.SMS.config
+    const born = (cfg.graves && cfg.graves.bornAtGrave) || []
+    if (born.indexOf('' + realm) === -1) return null
+    const nbt = cfg.nbt
+    const tag = global.SMS.persistedTag(player)
+    if (!tag.getBoolean(nbt.humanDeathSet)) return null
+    if (global.SMS.nbtString(tag, nbt.humanDeathDim) !== '' + global.SMS.dimensionForRealm(realm)) return null
+    var x = Number(tag.getDouble(nbt.humanDeathX))
+    var y = Number(tag.getDouble(nbt.humanDeathY))
+    var z = Number(tag.getDouble(nbt.humanDeathZ))
+    if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return null
+    return { x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) }
+}
+
+// Where to search around. Rebirth means losing your place in the world, so this is the
+// realm's configured spawn -- never the death position, which made a same-realm death
+// indistinguishable from a vanilla respawn -- with ONE exception: a realm born at its
+// grave (graveAnchor above) anchors on the last HUMAN death, which is a different life's
+// place, not the death that just happened.
 global.SMS.rebirthAnchor = (player, realm) => {
     const cfg = global.SMS.config
+    try {
+        var grave = global.SMS.graveAnchor(player, realm)
+        if (grave) return grave
+    } catch (e) {
+        console.warn(`[Samsara] grave anchor unreadable for ${player.profile.name}; using the realm spawn: ${e}`)
+    }
     try {
         var c = cfg.realmSpawns ? cfg.realmSpawns[realm] : null
         if (c) return { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) }
@@ -651,6 +712,13 @@ global.SMS.pickDestination = player => {
     }
 
     const anchor = global.SMS.rebirthAnchor(player, realm)
+    // Born at the grave (a preta at its last human death)? Named in the rebirth line.
+    var atGrave = false
+    try {
+        atGrave = !!global.SMS.graveAnchor(player, realm)
+    } catch (ignored) {
+        atGrave = false
+    }
 
     // Vanilla Nether is 1:8; Samsara's own dimensions are all 1:1.
     var bx = anchor.x
@@ -669,7 +737,7 @@ global.SMS.pickDestination = player => {
     const skyMode = cavern ? 'ignore' : 'require'
 
     // --- Cache hit? Re-validate before trusting it.
-    var cacheKey = realm + '@' + dimId
+    var cacheKey = spawnCacheKey(realm, dimId, searchAnchor)
     var cached = global.SMS.spawnCache[cacheKey]
     if (cached) {
         // `|| 0` because samsara_decay.js owns tickClock and load order between
@@ -687,6 +755,7 @@ global.SMS.pickDestination = player => {
                     stats: stats,
                     rule: rule,
                     cached: true,
+                    atGrave: atGrave,
                 }
             }
         }
@@ -748,10 +817,12 @@ global.SMS.pickDestination = player => {
             stats: stats,
             rule: rule,
             degraded: true,
+            atGrave: atGrave,
         }
     }
 
     // Cache the verified spot so the next death in this realm is nearly free.
+    pruneSpawnCache()
     global.SMS.spawnCache[cacheKey] = {
         x: found.spot.x,
         y: found.spot.y,
@@ -767,6 +838,7 @@ global.SMS.pickDestination = player => {
         stats: stats,
         rule: rule,
         pass: found.pass,
+        atGrave: atGrave,
     }
 }
 
@@ -829,6 +901,16 @@ global.SMS.grantLiberation = (player, reason) => {
         // tell() unavailable; the log line above is enough
     }
 
+    // Lift the realm's penalties NOW: the player's own body back, out of Adventure
+    // mode, no preta clock. Until 2026-10-22 only the flag was set, so `/karma
+    // liberate` on an animal-born player left them in the creature body until their
+    // next death -- found by the in-game test (row 18).
+    try {
+        global.SMS.applyRealmEffects(player)
+    } catch (e) {
+        console.warn(`[Samsara] liberation: applyRealmEffects failed: ${e}`)
+    }
+
     return true
 }
 
@@ -840,6 +922,14 @@ global.SMS.grantLiberation = (player, reason) => {
 // pos, angle, forced = true, ...), verified in the KubeJS 6 and 7 jars.
 //
 // Editing SpawnX/SpawnY/SpawnZ NBT does NOT work -- that is only the serialized form.
+// The body an animal birth gets: '' for any other realm, and '' when nothing is
+// configured (applyRealmEffects then leaves the player in their own body).
+function animalFormAtDeath(player, realm, nowT) {
+    if ('' + realm !== 'animal') return ''
+    var pick = global.SMS.animalFormFor(global.SMS.getStats(player), '' + player.uuid + ':' + nowT)
+    return pick ? pick.form : ''
+}
+
 EntityEvents.death(event => {
     const player = event.entity
     if (!player || !player.isPlayer()) return
@@ -872,6 +962,14 @@ EntityEvents.death(event => {
     // Resolve the destination once and stash it, so PlayerEvents.respawned does not
     // repeat the whole search. The old code ran pickDestination in BOTH hooks: two
     // full world scans per death.
+    //
+    // FIRST record a human death: it is where Tombstone leaves this life's grave, and
+    // the anchor of a preta birth -- including the one this very death may route to.
+    try {
+        global.SMS.recordHumanDeath(player)
+    } catch (e) {
+        console.warn(`[Samsara] could not record the human death of ${player.profile.name}: ${e}`)
+    }
     try {
         var dest = global.SMS.pickDestination(player)
 
@@ -902,12 +1000,17 @@ EntityEvents.death(event => {
                 y: dest.spot.y,
                 z: dest.spot.z,
                 at: nowT,
+                // An animal birth's BODY, chosen now, from the stats that routed it --
+                // ripening below changes them (it halves delusion), and the diet must
+                // follow the karma that caused the birth, as the realm does.
+                form: animalFormAtDeath(player, dest.realm, nowT),
                 // Carried so the respawn log can name HOW the spot was chosen. The
                 // respawn handler has no access to the destination object on this
                 // path, and a bad placement is undiagnosable without it.
-                how: dest.degraded
+                how: (dest.degraded
                     ? 'DEGRADED (no spot found; carved at anchor)'
-                    : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?')),
+                    : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?'))) +
+                    (dest.atGrave ? ' at-grave' : ''),
             }
             player.setSpawnLocation(dest.level.getBlock(dest.spot.x, dest.spot.y, dest.spot.z))
 
@@ -989,13 +1092,14 @@ PlayerEvents.respawned(event => {
         pending = null
     }
 
-    var realm, dimId, spot, stats, how
+    var realm, dimId, spot, stats, how, form
     if (pending) {
         realm = pending.realm
         dimId = pending.dimId
         spot = { x: pending.x, y: pending.y, z: pending.z }
         stats = global.SMS.getStats(player)
         how = pending.how || '?'
+        form = pending.form || ''
     } else {
         // No stashed destination (server restarted between death and respawn, or the
         // death hook failed). Resolve now.
@@ -1017,9 +1121,12 @@ PlayerEvents.respawned(event => {
         dimId = dest.dimId
         spot = dest.spot
         stats = dest.stats
-        how = dest.degraded
+        how = (dest.degraded
             ? 'DEGRADED (no spot found; carved at anchor)'
-            : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?')) + ' (late-resolve)'
+            : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?')) + ' (late-resolve)') +
+            (dest.atGrave ? ' at-grave' : '')
+        // Nothing ripened on this path, so the stats are still the ones that routed it.
+        form = animalFormAtDeath(player, realm, global.SMS.tickClock || 0)
     }
 
     // Only one teleportTo overload exists:
@@ -1050,8 +1157,10 @@ PlayerEvents.respawned(event => {
     player.teleportTo(dimId, spot.x + 0.5, spot.y, spot.z + 0.5, yaw, pitch)
 
     // Record the realm this life began in. Realm PENALTIES follow birthRealm, never the
-    // dimension the player happens to stand in.
+    // dimension the player happens to stand in. The body is recorded with it ('' for
+    // any realm but animal), and applyRealmEffects below puts the player in it.
     global.SMS.persistedTag(player).putString(cfg.nbt.birthRealm, realm)
+    global.SMS.persistedTag(player).putString(cfg.nbt.animalForm, form)
 
     // Apply the new realm's penalties NOW, immediately after writing birthRealm.
     //
@@ -1067,6 +1176,12 @@ PlayerEvents.respawned(event => {
     } catch (e) {
         console.warn(`[Samsara] applyRealmEffects after rebirth failed: ${e}`)
     }
+    // A birth, so say what this life's rules are (samsara_realms.js).
+    try {
+        if (global.SMS.tellBirthRules) global.SMS.tellBirthRules(player)
+    } catch (ignored) {
+        // messaging is best-effort
+    }
 
     // `how` is the placement provenance (which pass matched / cached / degraded),
     // set in both branches above and carried through pendingRebirth on the normal
@@ -1076,6 +1191,7 @@ PlayerEvents.respawned(event => {
     console.info(
         `[Samsara] rebirth: ${player.profile.name} -> ${realm} (${dimId})` +
             ` @ ${spot.x},${spot.y},${spot.z} [${how}]` +
+            (form ? ` [body ${form}]` : '') +
             ` [poisons g=${stats.greed} h=${stats.hatred} d=${stats.delusion}` +
             ` antidotes gen=${stats.generosity} met=${stats.metta} wis=${stats.wisdom}]`
     )
@@ -1120,9 +1236,6 @@ ServerEvents.commandRegistry(event => {
                         return 1
                     }
 
-                    // Bypass the cache so this always measures a real search.
-                    delete global.SMS.spawnCache[realm + '@' + dimId]
-
                     const anchor = global.SMS.rebirthAnchor(player, realm)
                     var bx = anchor.x
                     var bz = anchor.z
@@ -1130,6 +1243,8 @@ ServerEvents.commandRegistry(event => {
                         bx = Math.floor(bx / 8)
                         bz = Math.floor(bz / 8)
                     }
+                    // Bypass the cache so this always measures a real search.
+                    delete global.SMS.spawnCache[spawnCacheKey(realm, dimId, { x: bx, z: bz })]
                     loadChunkAt(level, bx, bz)
 
                     const found = findRebirthSpot(level, realm, { x: bx, y: anchor.y, z: bz }, dimId)

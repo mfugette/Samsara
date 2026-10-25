@@ -4,8 +4,11 @@
 // Shared across the other samsara_*.js files via the global.SMS namespace, and read at
 // runtime, not load time. Highest priority anyway (KubeJS 7 loads `// priority: N`
 // highest first, then by path): every other file may assume global.SMS.config exists.
-
-global.SMS = global.SMS || {}
+//
+// global.SMS itself is created by startup_scripts/samsara_global.js: on KubeJS 7 a
+// server script cannot create a key of `global`, only add to the object under one
+// (J38). No server script may write `global.SMS = ...`, not even `|| {}`.
+if (!global.SMS) throw new Error('global.SMS is missing: startup_scripts/samsara_global.js has not run (it needs a game restart, not /reload)')
 
 // ---- The six karma stats: three Poisons and three Antidotes -----------------
 //
@@ -66,7 +69,10 @@ global.SMS.config = {
         // A HOSTILE kill is the full rate here, then falls off within a life per
         // hostileKillTiers below, and is tracked as COMBAT hatred (see that block).
         killHostile: 1,
-        hurtPassive: 1, // struck a peaceful being and left it alive: THE unit
+        // Struck a peaceful being: THE unit. Paid on the blow, once per mob per
+        // hurtEntityTicks, so a kill pays it too -- each blow is its own harm (decided
+        // 2026-10-21): a melee cow kill costs 1 + 3.
+        hurtPassive: 1,
         killPassive: 3, // animals and other peaceful mobs
         killBaby: 5, // a baby animal
         killTamed: 10, // a tamed or named animal: betrayal of a bond
@@ -100,6 +106,9 @@ global.SMS.config = {
         // limited per player (karmaAntiFarm.feedPerPlayer*), or a pen is a vending
         // machine.
         feedAnimal: 0.5,
+        // A herbivore giving its body to a predator without resisting (see
+        // config.animalBirth.offering). Once per life at most -- it ends the life.
+        offerBody: 5,
 
         // --- Metta: non-hatred (adosa) ---
         // Metta comes from two sources only: meditation (phase 6, not built) and
@@ -145,6 +154,7 @@ global.SMS.config = {
         repeatDeath: 'delusion',
 
         feedAnimal: 'generosity',
+        offerBody: 'generosity',
 
         enduredEncounter: 'metta',
     },
@@ -405,7 +415,11 @@ global.SMS.config = {
     // sole entrance.
     realmDimensions: {
         naraka: 'samsara:naraka',
-        preta: 'samsara:preta',
+        // Pretas haunt the human world (design doc 7.4; Khp 7, the Tirokudda: "outside
+        // the walls they stand... returning to their old homes"), born where they last
+        // died as a human -- see graves.bornAtGrave. samsara:preta still EXISTS,
+        // unrouted, for the same reason as samsara:asura below.
+        preta: 'minecraft:overworld',
         animal: 'minecraft:overworld', // the animal realm shares the human world
         // Asuras live at the foot of Mount Sineru (Ja 31: cast down from Tavatimsa to
         // "the lowest level of Mount Sineru"), so they are born in its dimension -- the
@@ -436,21 +450,21 @@ global.SMS.config = {
             maxHealth: 10.0,
         },
 
+        // Redesigned 2026-10-22 (the user): a preta is a GHOST. Normal health, but nothing
+        // can harm it; the bar can fill; every meal is one crumb; and the life itself is
+        // a 30-minute clock that a full belly halves. The 3-icon cap, the 0.2 food
+        // multiplier and the 14 max health are gone. Later the same day: it haunts the
+        // human world, born where it last died as a human (graves.bornAtGrave), wears
+        // Samsara's own Hungry Ghost effect, and when the craving is spent it is HUMAN
+        // again -- no death.
         preta: {
-            // Hungry ghost: a huge belly and a pinhole mouth. Food the preta eats for
-            // itself barely registers -- generosity will be the efficient way to eat
-            // once feeding others is implemented (design doc 7).
-            foodMultiplier: 0.2,
-
-            // The hunger bar is CAPPED, not just lowered once. 6 points = 3 icons
-            // (the bar is drawn as 10 icons over 20 points, so one icon is 2 points).
-            // Enforced as a ceiling on a timer because vanilla keeps refilling it:
-            // a one-shot setFoodLevel would be undone by the next meal.
-            foodCap: 6.0,
+            // A huge belly and a pinhole mouth: EVERY meal restores exactly this many
+            // points, whatever the food, and no saturation. Corrected inside the meal
+            // (samsara_realms.js), so nothing is queued.
+            foodPerMeal: 1,
 
             // A permanent, renewed hunger effect: the preta is never not starving.
-            // amplifier 0 is Hunger I -- it drains saturation/food steadily. Higher
-            // amplifiers drain fast enough to starve through the cap continuously.
+            // amplifier 0 is Hunger I -- it drains saturation/food steadily.
             hungerEffect: {
                 id: 'minecraft:hunger',
                 amplifier: 0,
@@ -460,22 +474,194 @@ global.SMS.config = {
                 durationTicks: 400,
             },
 
-            // Spectral and starved: a diminished body, though less so than naraka.
-            maxHealth: 14.0,
+            // Nothing can harm a ghost: every damage source is refused, through
+            // NeoForge's EntityInvulnerabilityCheckEvent -- so starving costs no health
+            // either. The two sources vanilla lets through invulnerability (the void and
+            // /kill, tag minecraft:bypasses_invulnerability) still kill.
+            noDamage: true,
+
+            // Nothing hunts a ghost: a mob about to target a living preta targets nothing
+            // instead (NeoForge's LivingChangeTargetEvent, samsara_realms.js). Replaces
+            // Tombstone's Ghostly Shape, whose once-a-second tick refilled the food bar
+            // and cleared every harmful effect -- the hunger, the very thing a preta is.
+            ignoredByMobs: true,
+
+            // THE LIFE. The effects below start at birth and last `ticks`; when they
+            // run out the craving is spent and the player is human again (decided
+            // 2026-10-22 -- no death; samsara_realms.js). The CLOCK is Samsara's, stored
+            // in nbt.pretaLife, and the effects are drawn from it -- so drinking milk
+            // cannot end the life early. A meal that fills the bar to 20 halves what is
+            // left, but only once the bar has fallen to `rearmFood` or below since birth
+            // or the last halving: the bar is FULL at birth, so without that one bite
+            // would halve the life.
+            //
+            // ONE effect: Samsara's own Hungry Ghost (startup_scripts/samsara_effects.js),
+            // whose timer is the life left. It carries vanilla Slowness I and Weakness I
+            // as attribute modifiers, and is NEUTRAL, so nothing that cleanses harmful
+            // effects strips it. The id must match the startup script (harness 26).
+            life: {
+                ticks: 36000, // 30 min
+                effects: [{ id: 'samsara:hungry_ghost', amplifier: 0 }],
+                rearmFood: 6, // 3 icons
+            },
+
+            // No building or breaking: real Adventure mode (see animal below).
+            adventureMode: true,
+            noContainers: true,
+            // A ghost holds only food.
+            pickUp: 'food',
         },
 
         animal: {
-            // An animal has no hands for tools and no mind for planning. It can
-            // still fight, forage, break blocks and carry items, but it cannot
-            // craft, open containers, or build.
+            // An animal has no hands for tools and no mind for planning: it cannot
+            // craft or open containers, and (Adventure mode, decided 2026-10-22) it
+            // cannot break or place blocks or use a tool on one. It still fights, eats,
+            // and grazes or hunts by its diet (config.animalBirth).
             noCrafting: true,
             noContainers: true,
-            noBlockPlacing: true,
+            // Real vanilla Adventure mode, set at birth and put back to survival at any
+            // other birth. Samsara only ever swaps survival <-> adventure: a player in
+            // creative or spectator (an admin) is left alone.
+            adventureMode: true,
+            // What it may pick up follows its diet: config.animalBirth.pickUpByDiet.
+            pickUp: 'diet',
         },
     },
 
-    // Blocks an animal-realm player may not open. Matched by suffix so modded
-    // variants (copper_chest, oak_barrel, ...) are caught without listing each one.
+    // ---- What an animal birth means beyond the penalties above (2026-10-21) ----------
+    animalBirth: {
+        // THE BODY. An animal-born player is drawn as an Alex's Mobs creature through
+        // Woodwalkers (`walkers switchShape`, run at server permission). Which DIET the
+        // body has follows the karma that caused the birth -- worse karma, a carnivore
+        // -- measured by Net (A / total) of the stats at death, BEFORE ripening: the same
+        // numbers that routed the player here. Inside the animal realm Net runs from 0
+        // up to routing.lowerNet (0.40); a forced or admin birth can sit anywhere.
+        //
+        // Tiers are listed gentlest first and the first whose minNet <= Net wins, so
+        // the last must be 0. Within a tier the creature is picked at random (seeded per
+        // birth) and kept for that whole life. The lists are CANDIDATES until checked in
+        // game: a creature that renders or moves badly as a player body comes out.
+        // Left out on purpose: water-only creatures, Nether/End creatures, and bodies
+        // built from linked parts (anaconda, centipede), which do not make a player shape.
+        //
+        // The body OWNS max health while it is worn: Woodwalkers scales it from the
+        // creature (capped by its own config at 40), and applyRealmEffects does not write
+        // it for an animal-born player. See samsara_realms.js.
+        tiers: [
+            {
+                diet: 'herbivore',
+                minNet: 0.25,
+                forms: [
+                    'alexsmobs:gazelle', 'alexsmobs:kangaroo', 'alexsmobs:jerboa',
+                    'alexsmobs:gelada_monkey', 'alexsmobs:gorilla', 'alexsmobs:bison',
+                    'alexsmobs:moose', 'alexsmobs:elephant', 'alexsmobs:hummingbird',
+                ],
+            },
+            {
+                diet: 'omnivore',
+                minNet: 0.1,
+                forms: [
+                    'alexsmobs:raccoon', 'alexsmobs:skunk', 'alexsmobs:capuchin_monkey',
+                    'alexsmobs:grizzly_bear', 'alexsmobs:maned_wolf', 'alexsmobs:emu',
+                    'alexsmobs:cockroach', 'alexsmobs:crow', 'alexsmobs:blue_jay',
+                    'alexsmobs:toucan',
+                ],
+            },
+            {
+                diet: 'carnivore',
+                minNet: 0,
+                forms: [
+                    'alexsmobs:tiger', 'alexsmobs:snow_leopard', 'alexsmobs:komodo_dragon',
+                    'alexsmobs:crocodile', 'alexsmobs:caiman', 'alexsmobs:rattlesnake',
+                    'alexsmobs:tasmanian_devil', 'alexsmobs:roadrunner',
+                    'alexsmobs:bald_eagle', 'alexsmobs:shoebill',
+                ],
+            },
+        ],
+
+        // An animal's own killing is FREE (decided 2026-10-21). An animal birth is old
+        // karma ripening, with little power to make new karma -- and a carnivore body
+        // has to hunt to eat; charging it hatred would chain it to the lower realms.
+        // Checked inside global.SMS.award, the one seam every hook goes through, so no
+        // hook can forget it. Other acts (feeding, enduring, careless deaths) still count.
+        freeActs: ['hurtPassive', 'killHostile', 'killPassive', 'killBaby', 'killTamed', 'killVillager'],
+
+        // HOW EACH DIET EATS (decided 2026-10-22). What it may pick up: 'none', 'meat'
+        // or 'food'. A herbivore picks up nothing and GRAZES (below); a carnivore picks
+        // up meat and eats it; an omnivore does both. A body with no configured diet
+        // reads as an omnivore, so a config gap can never starve a player.
+        pickUpByDiet: { herbivore: 'none', omnivore: 'meat', carnivore: 'meat' },
+
+        // What counts as meat: item tags (checked with ItemStack.is) plus explicit ids
+        // for modded meats no tag carries. Fish counts: flesh is flesh, and half the
+        // carnivore bodies (crocodile, caiman, shoebill, bald eagle) eat fish.
+        meat: {
+            tags: ['minecraft:meat', 'minecraft:fishes', 'c:foods/raw_meat', 'c:foods/cooked_meat', 'c:foods/raw_fish', 'c:foods/cooked_fish'],
+            items: [
+                'alexsmobs:kangaroo_meat', 'alexsmobs:cooked_kangaroo_meat', 'alexsmobs:moose_ribs',
+                'alexsmobs:cooked_moose_ribs', 'alexsmobs:lobster_tail', 'alexsmobs:cooked_lobster_tail',
+            ],
+        },
+
+        // GRAZING: right-click one of `blocks` with an EMPTY main hand, while the bar is
+        // not full, to eat it -- it turns into what it maps to, as a sheep's grass does.
+        // It feeds `nutrition` points (vanilla FoodData.eat, via PlayerKJS.addFood).
+        graze: {
+            diets: ['herbivore', 'omnivore'],
+            blocks: { 'minecraft:grass_block': 'minecraft:dirt' },
+            nutrition: 2,
+            saturationModifier: 0.1,
+        },
+
+        // THE OFFERING OF THE BODY (decided 2026-10-22): a herbivore-born player killed
+        // by a predator, having struck nothing in the endurance.quietTicks before, pays
+        // karma.offerBody (generosity). The Sasa Jataka's hare (Ja 316) offers its own
+        // body as food -- the animal realm's being in design doc 8 -- and the gift of
+        // the body is the highest dana. Carnivores and omnivores cannot make it.
+        //   predators          mob ids that count, beyond the tiers below
+        //   predatorDiets      any creature in these diets' tiers counts, as a mob or
+        //                      as a player wearing that body
+        //   blockRapidDeath    no pay for a death inside ripening.cooldownTicks of the
+        //                      previous one -- the same guard endurance has, for the
+        //                      same exploit (dying as a reset button)
+        offering: {
+            diets: ['herbivore'],
+            predators: ['minecraft:wolf', 'minecraft:polar_bear', 'minecraft:fox', 'alexsmobs:grizzly_bear', 'alexsmobs:orca', 'alexsmobs:anaconda'],
+            predatorDiets: ['carnivore'],
+            blockRapidDeath: true,
+        },
+    },
+
+    // ---- Graves and their keys (Corail Tombstone; decided 2026-10-22) -------------
+    // ONLY HUMANS HAVE GRAVES. A human's death leaves Tombstone's grave and key as
+    // usual; any other birth's death leaves no grave (samsara_tombstone.js vetoes it),
+    // and its items drop on the ground as vanilla drops them. The human grave stays
+    // however many births later, and its key is held ONLY in a human life: in any
+    // other birth Samsara keeps it (nbt.graveKeys) and gives it back at the next human
+    // life -- for a preta, the moment its craving is spent. Nothing here runs without
+    // the mod (Platform.isLoaded).
+    //   keyItem       Tombstone's grave key (it opens the grave, or teleports to it)
+    //   graveBlocks   the PLAYER-grave blocks, one per GraveModel; the decorative_*
+    //                 variants are building blocks, not graves
+    //   bornAtGrave   realms born at the player's last HUMAN death -- the place it
+    //                 haunts -- when that death was in the realm's own dimension
+    graves: {
+        mod: 'tombstone',
+        keyItem: 'tombstone:grave_key',
+        graveBlocks: [
+            'tombstone:grave_simple',
+            'tombstone:grave_normal',
+            'tombstone:grave_cross',
+            'tombstone:grave_original',
+            'tombstone:tombstone',
+            'tombstone:subaraki_grave',
+        ],
+        bornAtGrave: ['preta'],
+    },
+
+    // Blocks a player born into a realm with noContainers (animal, preta) may not open.
+    // Matched by suffix so modded variants (copper_chest, oak_barrel, ...) are caught
+    // without listing each one.
     containerBlockSuffixes: [
         'chest',
         'barrel',
@@ -668,7 +854,6 @@ global.SMS.config = {
     //
     //   realm   gradient         density=0   observed landing
     //   asura   (none: Mount Sineru's first alinda, y 71, a generated template)
-    //   preta   y 0..12          y~11         9
     //   naraka  y 0..24          y~18        18
     //   deva    y 72..100        y~94       138   (noise lifts the islands well above)
     //   brahma  y 120..148       y~146      161
@@ -678,7 +863,10 @@ global.SMS.config = {
         human: { x: 0, y: 72, z: 0 },
         animal: { x: 0, y: 72, z: 0 }, // shares the human world
         naraka: { x: 0, y: 18, z: 0 }, // cavern floor
-        preta: { x: 0, y: 11, z: 0 }, // shallow caves under a ceiling
+        // The human world too, but a preta is born at its last human death
+        // (graves.bornAtGrave): this is only the fallback, for a player who has never
+        // died a human in the Overworld.
+        preta: { x: 0, y: 72, z: 0 },
         // The foot of Mount Sineru: on the first alinda at the head of the south entrance
         // stair, which climbs out of the sea. MUST be standable on the generated
         // template (harness 20 checks it): the alinda's top block is y 71.
@@ -701,7 +889,7 @@ global.SMS.config = {
     // Keyed by REALM, not by dimension id: a third-party override dimension then
     // inherits the right behaviour automatically. Matches has_skylight:false /
     // has_ceiling:true in each dimension_type JSON.
-    cavernRealms: ['naraka', 'preta'],
+    cavernRealms: ['naraka'],
 
     // Full height range to search per realm.
     //
@@ -711,14 +899,13 @@ global.SMS.config = {
     //
     // Verified against kubejs/data/samsara/dimension_type/*.json:
     //   naraka  min_y 0,   height 128  -> 0..128
-    //   preta   min_y 0,   height 128  -> 0..128
     //   asura   samsara:sineru, min_y -64, height 704 -> -64..640
     //   deva    min_y 0,   height 256  -> 0..256
     //   brahma  min_y 0,   height 256  -> 0..256
-    //   overworld (human/animal)       -> -64..320
+    //   overworld (human/animal/preta) -> -64..320
     realmScanBounds: {
         naraka: { min: 1, max: 127 },
-        preta: { min: 1, max: 127 },
+        preta: { min: -63, max: 319 },
         asura: { min: -63, max: 639 },
         deva: { min: 1, max: 255 },
         brahma: { min: 1, max: 255 },
@@ -920,6 +1107,7 @@ global.SMS.config = {
         minSurfaceY: {
             human: 50,
             animal: 50,
+            preta: 50,
             asura: 64, // above the sea: in the Sineru dimension only the mountain is ground
             deva: 80,
             brahma: 100,
@@ -972,12 +1160,20 @@ global.SMS.config = {
         legacyVirtue: 'samsara_virtue',
         legacyMeditation: 'samsara_meditation',
 
-        // Where the player died -- the rebirth search anchors here, because by
-        // respawn time player.x/y/z already describe the NEW position.
-        deathX: 'samsara_death_x',
-        deathY: 'samsara_death_y',
-        deathZ: 'samsara_death_z',
-        deathPosSet: 'samsara_death_set',
+        // Where the player last died AS A HUMAN, and in which dimension -- where
+        // Tombstone left their grave, and where a realm in graves.bornAtGrave is born.
+        // Written at a human death only, so it survives any number of other births.
+        // (Replaces the old samsara_death_* keys, which nothing had read since rebirth
+        // started anchoring on realmSpawns.)
+        humanDeathX: 'samsara_human_death_x',
+        humanDeathY: 'samsara_human_death_y',
+        humanDeathZ: 'samsara_human_death_z',
+        humanDeathDim: 'samsara_human_death_dim',
+        humanDeathSet: 'samsara_human_death_set',
+
+        // The grave keys Samsara holds while the player is not human: a compound of
+        // ItemStacks saved with ItemStack.save, under `k0`..`k<n-1>`, and `n`.
+        graveKeys: 'samsara_grave_keys',
 
         // Ripening / death bookkeeping.
         lastDeathTick: 'samsara_last_death_tick',
@@ -1002,6 +1198,20 @@ global.SMS.config = {
         // karma comparison entirely and sends the player there. Cleared with
         // `/karma forcerealm <player> none`.
         forcedRealm: 'samsara_forced_realm',
+
+        // The creature an animal-born player is drawn as this life ('' = no body
+        // chosen). Written at each birth; see config.animalBirth.
+        animalForm: 'samsara_animal_form',
+
+        // A preta's life (realmEffects.preta.life): ticks left on the clock (0 = no
+        // clock running), and whether a full bar may halve it yet (1 = yes). Per-life:
+        // zeroed at death by global.SMS.resetLifeCounters.
+        pretaLife: 'samsara_preta_life',
+        pretaHalveArmed: 'samsara_preta_halve_armed',
+
+        // 1 while Samsara holds the player in Adventure mode (it switched them from
+        // survival), so leaving the realm puts back only what Samsara changed.
+        adventureSet: 'samsara_adventure_set',
     },
 }
 

@@ -26,8 +26,6 @@
 // between lives -- the soft form of the canonical rule that stream-entry
 // permanently closes off the lower realms.
 
-global.SMS = global.SMS || {}
-
 // ---- Shared scaling --------------------------------------------------------
 
 // Multiply a set of stats by `keep` (a 0..1 retention factor).

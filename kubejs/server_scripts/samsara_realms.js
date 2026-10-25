@@ -1,11 +1,12 @@
 // priority: 60
 // Samsara — realm penalties.
 //
-// PRIORITY 60, above samsara_karma.js (50) and samsara_rebirth.js (40): an EXITING
-// handler stops the handlers after it, so the animal-realm placement refusal below
-// must run before karma's container-ownership recorder (a refused placement must not
-// be recorded), and this file's respawn safety net registers before rebirth's
-// respawn handler. KubeJS 7 orders files by `// priority: N` (higher first), then path.
+// PRIORITY 60, above samsara_rebirth.js (40): this file's respawn safety net
+// registers before rebirth's respawn handler, and global.SMS.birthRealmOf / effectsFor
+// exist before karma (50) and rebirth load. KubeJS 7 orders files by
+// `// priority: N` (higher first), then path. (Until 2026-10-22 it also had to beat
+// karma's BlockEvents.placed recorder with an animal placement refusal; Adventure
+// mode replaced that refusal, so there is no placed handler here any more.)
 //
 // CRITICAL RULE: penalties follow the player's `birthRealm`, NEVER the dimension they
 // are standing in. Players still need the Nether (blaze rods, netherite) and the End
@@ -21,8 +22,6 @@
 // the exit and silently un-cancels the event. So every refusal here sends its message
 // FIRST and calls cancel() LAST, outside any try. cancel() and cancel(false) are the
 // same result (INTERRUPT_FALSE).
-
-global.SMS = global.SMS || {}
 
 // The realm a player was BORN into. Falls back to human: a player who has never died
 // has no birthRealm recorded, and the human realm is the no-penalty default.
@@ -51,6 +50,152 @@ global.SMS.effectsFor = realm => {
     return global.SMS.config.realmEffects[key] || {}
 }
 
+// A realm's effects in plain words, for /karma (the raw JSON was unreadable).
+global.SMS.describeEffects = fx => {
+    var parts = []
+    if (fx.maxHealth !== undefined) parts.push('max health ' + fx.maxHealth)
+    if (fx.noDamage) parts.push('takes no damage')
+    if (fx.ignoredByMobs) parts.push('ignored by mobs')
+    if (fx.life) parts.push('a ' + Math.round(fx.life.ticks / 1200) + '-minute life')
+    if (fx.foodPerMeal !== undefined) parts.push(fx.foodPerMeal + ' food per meal')
+    if (fx.hungerEffect) parts.push('always hungry')
+    if (fx.adventureMode) parts.push('adventure mode')
+    if (fx.noContainers) parts.push('no containers')
+    if (fx.noCrafting) parts.push('no crafting')
+    if (fx.pickUp === 'food') parts.push('holds only food')
+    if (fx.pickUp === 'diet') parts.push('eats by its diet')
+    return parts.length === 0 ? 'no penalties' : parts.join(', ')
+}
+
+// Vanilla classes the realm rules use, loaded once (read from the 1.21.1 jars,
+// 2026-10-22). Each is null when it cannot be loaded, and its user says so.
+function loadVanilla(name) {
+    try {
+        return Java.loadClass(name)
+    } catch (e) {
+        console.warn(`[Samsara] could not load ${name}: ${e}`)
+        return null
+    }
+}
+const GameTypeClass = loadVanilla('net.minecraft.world.level.GameType')
+const DamageTypeTagsClass = loadVanilla('net.minecraft.tags.DamageTypeTags')
+const ResourceLocationClass = loadVanilla('net.minecraft.resources.ResourceLocation')
+const BuiltInRegistriesClass = loadVanilla('net.minecraft.core.registries.BuiltInRegistries')
+const VanillaBlockClass = loadVanilla('net.minecraft.world.level.block.Block')
+
+// ---- Commands at server permission -------------------------------------------
+//
+// Run `cmd` AS the player (so @s is them) but at SERVER permission. Never use
+// player.runCommandSilent for an op-level command: KubeJS 7 builds its source with
+// Entity.createCommandSourceStack(), which carries the PLAYER's own permission level
+// (J39, read from the jar) -- 0 for anyone who is not an op -- so /effect and /walkers
+// silently do nothing. Found 2026-10-21: the preta hunger effect had never reached a
+// non-op player; the tests only passed in a cheats-on singleplayer world, where the
+// player is op. server.runCommandSilent uses the server's own source (level 4), and
+// `execute as` keeps that level while making the player the executor. Throws when
+// there is no server; callers catch.
+global.SMS.serverCommand = (player, cmd) => {
+    player.getServer().runCommandSilent('execute as ' + player.uuid + ' run ' + cmd)
+}
+
+// ---- The animal body (Woodwalkers) -------------------------------------------
+//
+// An animal-born player is DRAWN as the creature recorded in nbt.animalForm (chosen by
+// diet from their karma -- config.animalBirth), through Woodwalkers. Read from the
+// installed walkers-5.8.13 jar (J40):
+//   - `walkers switchShape <players> <entity id>` and `... normal` are op-level, so
+//     they go through global.SMS.serverCommand.
+//   - config/walkers.json5 "apiLevel": 0 (API_ONLY) turns off the player's own unlock
+//     key, switch key and variant menu; the server re-checks it on the swap packet,
+//     and the command does not consult it. Without it any player could hold U at a
+//     cow and become one. The load-time check below warns when it is not set.
+//   - PlayerShape.getCurrentShape(Player) returns the worn creature, or null.
+//   - Woodwalkers writes max health (the attribute's base value) on every shape change
+//     and on respawn -- which is why applyRealmEffects leaves it to the body.
+// Woodwalkers is optional: without it an animal birth keeps the player's own body and
+// every other animal rule still applies.
+var walkersShapeClass = undefined
+
+function walkersLoaded() {
+    try {
+        return Platform.isLoaded('walkers') === true
+    } catch (ignored) {
+        return false
+    }
+}
+
+// The creature id the player is drawn as now: '' for their own body, null when it
+// cannot be read (the caller then switches anyway -- the command is idempotent).
+function wornForm(player) {
+    try {
+        if (walkersShapeClass === undefined) walkersShapeClass = Java.loadClass('tocraft.walkers.api.PlayerShape')
+        var shape = walkersShapeClass.getCurrentShape(player)
+        return shape ? '' + shape.type : ''
+    } catch (ignored) {
+        return null
+    }
+}
+
+// The body an animal-born player should wear. Normally written at birth by the rebirth
+// handler (from the stats that routed the birth); picked here, from the stats as they
+// are now, when it is missing or no longer configured -- an admin `/karma realm <p>
+// animal`, or a creature removed from the config since.
+function animalFormOf(player) {
+    var tag = global.SMS.persistedTag(player)
+    var key = global.SMS.config.nbt.animalForm
+    var form = global.SMS.nbtString(tag, key)
+    if (form && global.SMS.animalDietOf(form)) return form
+    var pick = global.SMS.animalFormFor(global.SMS.getStats(player), '' + player.uuid + ':' + (global.SMS.tickClock || 0))
+    form = pick ? pick.form : ''
+    tag.putString(key, form)
+    return form
+}
+
+// Put the player in `form` (a creature id) or, for '', back in their own body.
+// `owned` says whether a creature body is now worn -- and so owns max health.
+//
+// `form` is normalised to a JS string FIRST. The first in-game test (2026-10-22) passed
+// undefined here (N12 made the creature index NaN): the switch went to `normal` while
+// `owned` read true, so the player stayed human AND max health was left to a body they
+// did not have. Every decision below reads the one normalised value.
+global.SMS.setBody = (player, form) => {
+    var want = form ? '' + form : ''
+    if (!walkersLoaded()) return { owned: false, note: want ? 'own (no Woodwalkers)' : 'own' }
+    var worn = wornForm(player)
+    if (worn !== null && worn === want) return { owned: want !== '', note: want ? want + ' (already worn)' : 'own' }
+    global.SMS.serverCommand(player, 'walkers switchShape @s ' + (want || 'normal'))
+    return { owned: want !== '', note: want || 'own (switched back)' }
+}
+
+// Say whether bodies are safe: Woodwalkers must be at API_ONLY, or players can unlock
+// and switch bodies with its keys -- and nothing else would ever show it.
+//
+// Checked once the server has STARTED, never at script load. Woodwalkers applies its
+// config's apiLevel from a level-load callback (Walkers.initialize registers a lambda
+// on ServerLevel that calls ApiLevel.readConfig, J40), and KubeJS loads server scripts
+// BEFORE any level loads -- so read at load, the level is always the DEFAULT it starts
+// at. That was the false "not API_ONLY" warning in the first in-game test (2026-10-22).
+// ServerEvents.loaded fires after the levels have loaded.
+ServerEvents.loaded(event => {
+    try {
+        if (!walkersLoaded()) {
+            console.warn('[Samsara] Woodwalkers is not installed: animal births keep the player body')
+            return
+        }
+        var walkersLevel = '' + Java.loadClass('tocraft.walkers.api.platform.ApiLevel').getCurrentLevel()
+        if (walkersLevel === 'API_ONLY') {
+            console.info('[Samsara] animal bodies: Woodwalkers at API_ONLY -- only Samsara changes bodies')
+        } else {
+            console.warn(
+                `[Samsara] Woodwalkers API level is ${walkersLevel}, not API_ONLY: players can unlock and` +
+                    ' switch bodies themselves. Set "apiLevel": 0 in config/walkers.json5 and restart.'
+            )
+        }
+    } catch (e) {
+        console.warn(`[Samsara] could not read the Woodwalkers API level: ${e}`)
+    }
+})
+
 // ---- Applying and clearing effects -----------------------------------------
 
 // Max health is the only *persistent* attribute change so far, so it has to be
@@ -73,16 +218,167 @@ const VANILLA_MAX_HEALTH = 20.0
 // Returns null when unreadable, which callers must treat as "set it anyway" rather
 // than "skip": the whole point is that a missing getter must not disable the penalty.
 
-// How often the preta clamp runs. 4 ticks = 5x/second: frequent enough that a meal
-// cannot visibly push the bar past the cap, cheap enough to ignore (it is a numeric
-// compare per online player, and it early-returns on realms with no foodCap).
+// How often the preta tick runs. 4 ticks = 5x/second: often enough that the bar
+// record the meal correction reads is never more than a fraction of a second old, and
+// the life clock counts down in 4-tick steps. Cheap: a few reads per online player.
 const PRETA_INTERVAL_TICKS = 4
 
 // On global.SMS, not a file-local `let`, for the same reason global.SMS.tickClock is:
-// `global` survives /reload, so the clamp's cadence is not reset every time the
+// `global` survives /reload, so the tick's cadence is not reset every time the
 // scripts reload. It also lets the offline harness drive the throttle deterministically
 // instead of inheriting whatever phase an earlier test left it in.
 global.SMS.pretaCounter = global.SMS.pretaCounter || 0
+
+// ---- Adventure mode (animal and preta births, decided 2026-10-22) -----------
+//
+// Real vanilla Adventure mode is what stops breaking, placing and using a tool on a
+// block (ItemStack.useOn and buckets check Abilities.mayBuild): client-side too, so
+// there is no ghost block or crack animation. It does NOT stop opening chests, doors
+// or crafting tables -- noContainers below still refuses those.
+//
+// Writers of the game mode: an op's /gamemode, vanilla's forced default game mode on
+// join, and this. So Samsara only ever swaps SURVIVAL -> ADVENTURE (recording that it
+// did, in nbt.adventureSet) and, when the realm no longer wants it, puts back only an
+// ADVENTURE it set itself. A player in creative or spectator (an admin, a tester) is
+// left alone, and the rule then does not hold for them.
+//
+// ServerPlayer.setGameMode(GameType) and the public field gameMode
+// (ServerPlayerGameMode.getGameModeForPlayer) are vanilla; KubeJS adds no gameMode bean
+// of its own (ServerPlayerKJS, build 377), so neither name is shadowed.
+function gameModeOf(player) {
+    try {
+        return '' + player.gameMode.getGameModeForPlayer().getName()
+    } catch (ignored) {
+        return ''
+    }
+}
+
+// Returns a note for the realm-effects log line ('' when nothing applies).
+function applyGameMode(player, want) {
+    const tag = global.SMS.persistedTag(player)
+    const key = global.SMS.config.nbt.adventureSet
+    const ours = tag.getDouble(key) > 0
+    const mode = gameModeOf(player)
+    if (want) {
+        if (mode === 'survival' && GameTypeClass) {
+            player.setGameMode(GameTypeClass.ADVENTURE)
+            tag.putDouble(key, 1)
+            return 'adventure (set)'
+        }
+        if (mode === 'adventure') return 'adventure'
+        return (mode || 'unreadable') + ' (left alone)'
+    }
+    if (!ours) return ''
+    tag.putDouble(key, 0)
+    if (mode === 'adventure' && GameTypeClass) {
+        player.setGameMode(GameTypeClass.SURVIVAL)
+        return 'survival (restored)'
+    }
+    return (mode || 'unreadable') + ' (left alone)'
+}
+
+// ---- The preta life (realmEffects.preta.life) --------------------------------
+//
+// The CLOCK is stored (nbt.pretaLife, ticks left; 0 = none running) and counts down
+// only while the player is online, in the preta tick below. The effect -- Samsara's own
+// Hungry Ghost, whose timer is this clock -- is DRAWN from it: given for the time left,
+// re-given about once a second -- so milk, or anything else that clears it, cannot end
+// the life early -- and replaced when the clock is halved. `/effect give` cannot shorten
+// a running effect, hence the clear first.
+function giveLifeEffects(player, life, left, replace) {
+    var seconds = Math.ceil(left / 20)
+    if (!isFinite(seconds) || seconds < 1) seconds = 1
+    for (var i = 0; i < life.effects.length; i++) {
+        var e = life.effects[i]
+        if (replace) global.SMS.serverCommand(player, 'effect clear @s ' + e.id)
+        global.SMS.serverCommand(player, 'effect give @s ' + e.id + ' ' + seconds + ' ' + (e.amplifier || 0) + ' true')
+    }
+}
+
+function minutesSeconds(ticks) {
+    var s = Math.max(0, Math.ceil(ticks / 20))
+    var r = s % 60
+    return Math.floor(s / 60) + ':' + (r < 10 ? '0' : '') + r
+}
+global.SMS.minutesSeconds = minutesSeconds
+
+// The craving is spent (decided 2026-10-22, the user): the end of a preta's time is NOT a
+// death. The player is human again where it stands -- by the grave it has been haunting,
+// unless it wandered -- and applyRealmEffects lifts every preta rule (the hunger, the
+// Hungry Ghost effect, Adventure mode, the clock) and hands back the grave keys Samsara was
+// keeping (samsara_tombstone.js): the key opens the grave, or takes the player to it.
+// No routing and no ripening: those belong to a death, and this is not one.
+//
+// It used to end with kill(). Besides not being what the user wanted, that was fragile:
+// Tombstone's Ghostly Shape sets ALL damage to 0, generic_kill included, so a preta
+// wearing it would have survived its own end -- clock at 0, still a preta, forever.
+function endPretaLife(player) {
+    const name = player.profile.name
+    var keysKept = 0
+    try {
+        keysKept = global.SMS.graves ? global.SMS.graves.keysKept(player) : 0
+    } catch (ignored) {
+        keysKept = 0
+    }
+    global.SMS.persistedTag(player).putString(global.SMS.config.nbt.birthRealm, 'human')
+    try {
+        global.SMS.applyRealmEffects(player)
+    } catch (e) {
+        console.warn(`[Samsara] ${name}: lifting the preta's rules failed: ${e}`)
+    }
+    console.info(`[Samsara] ${name}: the preta's craving is spent -- human again`)
+    try {
+        player.tell(Text.yellow('The craving is spent. You are human again.'))
+        if (keysKept > 0) player.tell(Text.gray('  Your grave\'s key is in your hands again: it opens your grave, or takes you to it.'))
+    } catch (ignored) {
+        // messaging is best-effort
+    }
+}
+
+// One step of a running clock: re-arm the halving once the belly has emptied, count
+// down, and end the preta's time when it runs out. Ends only on the step that crosses
+// zero, so a player with no clock (0) is never touched by it.
+function pretaLifeStep(player, life, ticks) {
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    var left = Number(tag.getDouble(nbt.pretaLife))
+    if (!isFinite(left) || left <= 0) return
+    var food = Number(player.foodLevel)
+    if (isFinite(food) && food <= life.rearmFood) tag.putDouble(nbt.pretaHalveArmed, 1)
+    left = left - ticks
+    if (left <= 0) {
+        tag.putDouble(nbt.pretaLife, 0)
+        endPretaLife(player)
+        return
+    }
+    tag.putDouble(nbt.pretaLife, left)
+    if (left % 20 < ticks) giveLifeEffects(player, life, left, false)
+}
+
+// A meal filled the bar: halve what is left, if the belly has emptied since the last
+// time (or since birth). Never below one tick, so the next step still ends the life.
+function halvePretaLife(player, life) {
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    var left = Number(tag.getDouble(nbt.pretaLife))
+    if (!isFinite(left) || left <= 0) return false
+    if (!(tag.getDouble(nbt.pretaHalveArmed) > 0)) {
+        if (global.SMS.config.debugFood) console.info(`[Samsara] preta: ${player.profile.name} full, but not hungry since the last halving`)
+        return false
+    }
+    var half = Math.floor(left / 2)
+    if (half < 1) half = 1
+    tag.putDouble(nbt.pretaLife, half)
+    tag.putDouble(nbt.pretaHalveArmed, 0)
+    giveLifeEffects(player, life, half, true)
+    console.info(`[Samsara] preta: ${player.profile.name} ate to the full -- the life halves, ${minutesSeconds(left)} -> ${minutesSeconds(half)}`)
+    try {
+        player.tell(Text.gray(`Full, for a moment. Half of this life falls away: ${minutesSeconds(half)} remain.`))
+    } catch (ignored) {
+        // messaging is best-effort
+    }
+    return true
+}
 
 function readMaxHealth(player) {
     try {
@@ -113,33 +409,56 @@ function readMaxHealth(player) {
 // effect that writes something persistent MUST be undone here, not just skipped while
 // the new realm is active.
 //
-// Registry of what is stored vs live, as of 2026-10-21 (1.21.1):
-//   maxHealth       STORED attribute        -> reset by applyRealmEffects (new value)
+// Registry of what is stored vs live, as of 2026-10-22 (1.21.1):
+//   maxHealth       STORED attribute        -> reset by applyRealmEffects (new value),
+//                                              or left to a worn creature body
+//   body            STORED Woodwalkers shape -> set by applyRealmEffects every birth:
+//                                              the new creature, or back to the player
+//   adventureMode   STORED game mode        -> set or put back by applyRealmEffects
+//                                              (only what Samsara set: nbt.adventureSet)
 //   hungerEffect    STORED mob effect       -> cleared below
+//   life effects    STORED mob effects      -> cleared below; re-given from the clock
+//   life clock      STORED nbt.pretaLife    -> zeroed by applyRealmEffects outside a
+//                                              preta life, and at death (resetLifeCounters)
 //   notify cooldown STORED throttle         -> cleared below
+//   grave keys      STORED in Samsara's keep outside a human life (nbt.graveKeys)
+//                                           -> synced by applyRealmEffects
+//                                              (samsara_tombstone.js)
 //   noCrafting      live check              -> no teardown needed
 //   noContainers    live check              -> no teardown needed
-//   noBlockPlacing  live check              -> no teardown needed
-//   foodMultiplier  live check, corrected inside the meal itself -> nothing stored
-//   foodCap         live check              -> no teardown needed
+//   noDamage        live check              -> no teardown needed
+//   ignoredByMobs   live check              -> no teardown needed
+//   pickUp          live check              -> no teardown needed
+//   foodPerMeal     live check, corrected inside the meal itself -> nothing stored
 // (The 1.20.1 pendingFoodPenalty queue is gone: the meal is now corrected inside
 // foodEaten, so nothing is queued that could land on the next body.)
 global.SMS.clearPreviousLife = player => {
     var cleared = []
 
-    // The renewed hunger effect is STORED state on the player: it outlives the realm
-    // that applied it, because a MobEffect persists until it lapses or is removed.
-    // A preta reborn as a human would otherwise keep starving for up to
-    // hungerEffect.durationTicks into their new life. Removed unconditionally rather
-    // than only for ex-pretas: /effect clear on an effect you do not have is a no-op,
-    // and this must also undo an effect applied before a config change.
+    // The renewed hunger effect, and a preta life's effects, are STORED state on the
+    // player: a MobEffect persists until it lapses or is removed, so a preta reborn as
+    // a human would otherwise keep starving -- and keep the Hungry Ghost of a life it
+    // no longer has. Removed unconditionally rather than only for ex-pretas: /effect clear
+    // on an effect you do not have is a no-op, and this must also undo an effect
+    // applied before a config change. A living preta has its life effects given back
+    // straight after, by applyRealmEffects, from the clock.
     try {
         if (player.isPlayer()) {
-            player.runCommandSilent('effect clear @s minecraft:hunger')
+            global.SMS.serverCommand(player, 'effect clear @s minecraft:hunger')
             cleared.push('hungerEffect')
+            var realms = global.SMS.config.realmEffects
+            var names = Object.keys(realms)
+            for (var i = 0; i < names.length; i++) {
+                var life = realms[names[i]].life
+                if (!life) continue
+                for (var j = 0; j < life.effects.length; j++) {
+                    global.SMS.serverCommand(player, 'effect clear @s ' + life.effects[j].id)
+                }
+                cleared.push(names[i] + 'LifeEffects')
+            }
         }
     } catch (ignored) {
-        // runCommandSilent unavailable; the effect lapses on its own
+        // no server to run it on; the effect lapses on its own
     }
 
     // The anti-spam timer for refusal messages. Harmless, but a stale entry means the
@@ -162,9 +481,10 @@ global.SMS.applyRealmEffects = player => {
 
     // A liberated player is outside the cycle, so realm penalties no longer apply --
     // the project notes' liberation section lists realm penalties among the things turned
-    // off. Passing an unmapped realm name makes the code below reset maxHealth to
-    // vanilla 20 and leaves every live-checked restriction (crafting, containers,
-    // placing) reading as absent, which is exactly the intended teardown. Routing
+    // off. An empty effects table makes the code below reset maxHealth to vanilla 20,
+    // put back Adventure mode, stop a preta clock, and leaves every live-checked
+    // restriction (crafting, containers, damage, pickup) reading as absent, which is
+    // exactly the intended teardown. Routing
     // the liberation case through the SAME path rather than returning early is what
     // guarantees a player liberated while born-naraka does not keep five hearts.
     var liberated = false
@@ -183,12 +503,30 @@ global.SMS.applyRealmEffects = player => {
     // realm with no maxHealth entry actively resets it rather than inheriting.
     const cleared = global.SMS.clearPreviousLife(player)
 
+    // THE BODY, then max health -- in that order, here, because both write max health.
+    // Writers of the max-health base value: Woodwalkers (from the creature, on every
+    // shape change and respawn; and switching back to the player's own body restores
+    // its cached player value) and this function (the realm's value). So the body goes
+    // FIRST, and then:
+    //   - a creature body is worn -> its health stands; Samsara writes nothing.
+    //   - the player's own body   -> Samsara writes the realm's value over whatever
+    //                                Woodwalkers restored.
+    // A liberated player wears their own body: the animal realm no longer holds them.
+    const form = !liberated && realm === 'animal' ? animalFormOf(player) : ''
+    var body = { owned: false, note: 'own' }
+    try {
+        body = global.SMS.setBody(player, form)
+    } catch (e) {
+        console.warn(`[Samsara] could not set the body of ${player.profile.name} to '${form}': ${e}`)
+        body = { owned: false, note: 'own (switch failed)' }
+    }
+
     var current = readMaxHealth(player)
 
     // Set unconditionally when we cannot read the current value -- idempotent, and far
     // better than skipping the penalty because a getter is missing.
     var applied = false
-    if (current === null || current !== target) {
+    if (!body.owned && (current === null || current !== target)) {
         try {
             player.setMaxHealth(target)
             applied = true
@@ -197,13 +535,67 @@ global.SMS.applyRealmEffects = player => {
         }
     }
 
+    // ADVENTURE MODE: set for a realm that wants it, put back when it no longer does
+    // (a liberated player's fx is empty, so liberation puts it back too).
+    var modeNote = ''
+    try {
+        modeNote = applyGameMode(player, fx.adventureMode === true)
+    } catch (e) {
+        console.warn(`[Samsara] could not set the game mode of ${player.profile.name}: ${e}`)
+        modeNote = 'failed'
+    }
+
+    // THE PRETA LIFE: start the clock at the birth (it is 0 then: resetLifeCounters
+    // zeroes it at death, and /karma realm before re-applying), keep it at a login, and
+    // stop it outside a living preta. The effects are given from it at once, so they
+    // stand from the first second rather than from the next tick.
+    var lifeNote = ''
+    try {
+        var nbt = global.SMS.config.nbt
+        var tag = global.SMS.persistedTag(player)
+        var lifeLeft = Number(tag.getDouble(nbt.pretaLife))
+        if (fx.life) {
+            if (!(lifeLeft > 0)) {
+                lifeLeft = fx.life.ticks
+                tag.putDouble(nbt.pretaLife, lifeLeft)
+                tag.putDouble(nbt.pretaHalveArmed, 0)
+                lifeNote = ` life=${minutesSeconds(lifeLeft)} (new)`
+            } else {
+                lifeNote = ` life=${minutesSeconds(lifeLeft)} left`
+            }
+            giveLifeEffects(player, fx.life, lifeLeft, false)
+        } else if (lifeLeft > 0) {
+            tag.putDouble(nbt.pretaLife, 0)
+            cleared.push('pretaLife')
+        }
+    } catch (e) {
+        console.warn(`[Samsara] could not set the preta life of ${player.profile.name}: ${e}`)
+    }
+
+    // GRAVE KEYS: held only in a human life (config.graves). Synced at EVERY apply --
+    // a birth, a login, /karma realm, liberation, a preta's end -- so they follow
+    // birthRealm the moment it changes. Last, because it reads the liberation flag and
+    // birthRealm this call has just acted on. A respawn syncs once more a tick later
+    // (samsara_tombstone.js): Tombstone hands keys back at LOWEST priority, after this.
+    var keyNote = ''
+    try {
+        if (global.SMS.graves) keyNote = global.SMS.graves.syncKeys(player)
+    } catch (e) {
+        console.warn(`[Samsara] could not sync the grave keys of ${player.profile.name}: ${e}`)
+        keyNote = 'failed'
+    }
+
     // Log loudly enough that the next in-game test can CONFIRM this landed, rather
     // than us inferring it from the health bar. Reads back the attribute afterwards.
     var after = readMaxHealth(player)
     console.info(
-        `[Samsara] realm effects: ${player.profile.name} born-${realm}` +
-            ` maxHealth target=${target} before=${current} after=${after}` +
-            ` (setMaxHealth called: ${applied})` +
+        `[Samsara] realm effects: ${player.profile.name} born-${realm} body=${body.note}` +
+            (body.owned
+                ? ` maxHealth=${after} (the body's)`
+                : ` maxHealth target=${target} before=${current} after=${after} (setMaxHealth called: ${applied})`) +
+            (modeNote ? ` mode=${modeNote}` : '') +
+            lifeNote +
+            (keyNote ? ` keys=${keyNote}` : '') +
             (cleared.length > 0 ? ` [cleared from previous life: ${cleared.join(', ')}]` : '')
     )
 
@@ -260,21 +652,16 @@ PlayerEvents.respawned(event => {
     global.SMS.applyRealmEffects(event.entity)
 })
 
-// ---- Animal realm restrictions ---------------------------------------------
-
-// An animal has no hands for tools and no mind for planning. It can still fight,
-// forage, break blocks and carry items.
+// ---- Realm restrictions (animal, preta) --------------------------------------
 
 // Which restriction applies to THIS player right now, read fresh from birthRealm
 // every time so it stops the instant they are reborn elsewhere.
 //
 // The old helper was `isAnimalBorn()`, which returned `noCrafting === true` and was
 // then used to gate the CONTAINER and BLOCK-PLACING handlers as well. That coupled
-// three independent restrictions to one flag:
-//   - a realm with noBlockPlacing but no noCrafting would not have blocked placing;
-//   - giving any realm noCrafting would silently switch on container and placement
-//     restrictions it never asked for.
-// Each handler now asks for the specific effect it enforces.
+// independent restrictions to one flag: giving any realm noCrafting would silently
+// switch on restrictions it never asked for. Each handler asks for the specific effect
+// it enforces.
 function hasEffect(player, name) {
     if (!player) return false
     try {
@@ -284,10 +671,10 @@ function hasEffect(player, name) {
     }
 
     // Liberation turns every realm penalty off. Checked here rather than in each
-    // caller because all four live restrictions (crafting, containers, block
-    // placing, and anything added later) funnel through this one function -- so a
-    // liberated player born into the animal realm can craft and build again, which
-    // is what "realm penalties are turned off for them" means in the project notes.
+    // caller because the live restrictions (crafting, containers, damage, and anything
+    // added later) funnel through this one function -- so a liberated player born into
+    // the animal realm can craft and open things again, which is what "realm penalties
+    // are turned off for them" means in the project notes.
     try {
         if (global.SMS.isLiberated(player)) return false
     } catch (ignored) {
@@ -296,6 +683,11 @@ function hasEffect(player, name) {
     }
 
     return global.SMS.effectsFor(global.SMS.birthRealmOf(player))[name] === true
+}
+
+// Who is refused, for the message: 'An animal' or 'A hungry ghost'.
+function beingOf(player) {
+    return global.SMS.birthRealmOf(player) === 'preta' ? 'A hungry ghost' : 'An animal'
 }
 
 // Tell the player why something was refused, but not on every tick of a held click.
@@ -317,8 +709,11 @@ function refuse(player, message) {
         // messaging is best-effort
     }
 }
+// Shared with samsara_tombstone.js (the grave refusals), so every refusal shares one
+// throttle and one teardown (clearPreviousLife).
+global.SMS.refuse = refuse
 
-// Does this block id look like something an animal should not be able to open?
+// Does this block id look like something a restricted player should not open?
 function isContainerBlock(id) {
     const suffixes = global.SMS.config.containerBlockSuffixes
     for (let i = 0; i < suffixes.length; i++) {
@@ -333,7 +728,7 @@ function isContainerBlock(id) {
 // the craft-result notification, after the fact), so crafting cannot be prevented
 // outright. Two levers together get close:
 //
-//   1. Station access is refused above, which covers the crafting table, anvil,
+//   1. Station access is refused below, which covers the crafting table, anvil,
 //      smithing table, loom, stonecutter and the rest.
 //   2. The 2x2 inventory grid is client-driven, so the only server-side recourse is
 //      to destroy the result after the fact. Crude, but it means an animal gains
@@ -350,67 +745,85 @@ ItemEvents.crafted(event => {
     }
 })
 
-// net.minecraft.world.item.BlockItem, for "is this a block the player is placing?".
-// Loaded once. Vanilla classes and methods are callable by Mojang name on 1.21.1.
-// ItemNameBlockItem (seeds, redstone, string) extends it, so planting counts as
-// placing; tools (hoe, axe, shovel), flint and steel, bone meal, buckets and food do
-// not, so an animal can still use them.
-var BlockItemClass = null
-try {
-    BlockItemClass = Java.loadClass('net.minecraft.world.item.BlockItem')
-} catch (e) {
-    console.warn(`[Samsara] could not load BlockItem; animal placement falls back to the id round-trip: ${e}`)
+// BUILDING AND BREAKING are Adventure mode's job (applyRealmEffects, decided
+// 2026-10-22). Until then two handlers refused an animal's placing -- a rightClicked
+// gate on a held BlockItem and a BlockEvents.placed backstop, filtered because NeoForge
+// fires `placed` for every block a tool changes. Adventure mode stops all of it in
+// vanilla, tools included, so both are gone (git history has them).
+
+// ---- What a body may eat (animal diets, decided 2026-10-22) ------------------
+
+// The diet of an animal-born player's body. A body with no configured diet reads as
+// an omnivore: it may both graze and hunt, so a config gap can never starve anyone.
+function dietOfPlayer(player) {
+    const form = global.SMS.nbtString(global.SMS.persistedTag(player), global.SMS.config.nbt.animalForm)
+    return global.SMS.animalDietOf(form) || 'omnivore'
 }
 
-// Is this ItemStack a block the player would place?
-function isBlockItemStack(stack) {
-    if (!stack) return false
+// GRAZING: a herbivore (or omnivore) right-clicks grass with an empty main hand and
+// eats it; the block turns to dirt, as a sheep's grass does (SheepEatBlockGoal plays
+// level event 2001, the block's break particles and sound, and sets DIRT -- the same
+// two calls here). Fires only for the main hand: NeoForge posts RightClickBlock once
+// per hand, and an empty main hand is what "eating with the mouth" means. Not while
+// the bar is full, as vanilla will not let a player eat then.
+//
+// Adventure mode does not stop this: the right-click still reaches the server (it
+// opens doors and presses buttons), and the block is changed here, not by the player.
+//
+// Returns true when it grazed. Nothing here cancels the event.
+global.SMS.graze = (player, event) => {
+    const g = (global.SMS.config.animalBirth || {}).graze
+    if (!g) return false
     try {
-        if (stack.isEmpty()) return false
+        if (global.SMS.isLiberated(player)) return false
+    } catch (ignored) {
+        // fall through
+    }
+    if (global.SMS.birthRealmOf(player) !== 'animal') return false
+    if ((g.diets || []).indexOf(dietOfPlayer(player)) === -1) return false
+
+    var hand = ''
+    var from = ''
+    try {
+        hand = '' + event.getHand()
+        from = '' + event.block.id
+        if (!player.getMainHandItem().isEmpty()) return false
     } catch (ignored) {
         return false
     }
-    if (BlockItemClass) {
-        try {
-            return stack.getItem() instanceof BlockItemClass
-        } catch (ignored2) {
-            // fall through to the round-trip
-        }
-    }
-    // Fallback (the proven 1.20.1 test): a real block id round-trips through the
-    // block registry; a non-block resolves to the registry default, air, and does
-    // not. `!!Block.getBlock(id)` alone is WRONG -- air is a truthy object.
+    if (hand !== 'MAIN_HAND') return false
+    const to = g.blocks[from]
+    if (!to) return false
+    var food = Number(player.foodLevel)
+    if (!isFinite(food) || food >= 20) return false
+
     try {
-        var heldId = '' + stack.id
-        var resolved = Block.getBlock(heldId)
-        return !!resolved && heldId !== 'minecraft:air' && '' + Block.getId(resolved) === heldId
-    } catch (ignored3) {
+        var before = event.block.getBlockState()
+        // The block FIRST: if it cannot be changed, nothing was eaten.
+        event.block.setBlockState(BuiltInRegistriesClass.BLOCK.get(ResourceLocationClass.parse(to)).defaultBlockState())
+        player.addFood(g.nutrition, g.saturationModifier)
+        try {
+            event.block.getLevel().levelEvent(2001, event.block.getPos(), VanillaBlockClass.getId(before))
+            player.swing(event.getHand(), true)
+        } catch (ignored2) {
+            // feedback only
+        }
+        if (global.SMS.config.debugFood) {
+            console.info(`[Samsara] ${player.profile.name} grazed ${from} -> ${to}: food ${food} -> ${player.foodLevel}`)
+        }
+        return true
+    } catch (e) {
+        console.warn(`[Samsara] grazing failed for ${player.profile.name}: ${e}`)
         return false
     }
 }
 
-// The id of the block a block-item stack places, or '' (not a block item, unreadable).
-function placedIdOf(stack) {
-    if (!isBlockItemStack(stack)) return ''
-    try {
-        return '' + Block.getId(stack.getItem().getBlock())
-    } catch (ignored) {
-        try {
-            return '' + stack.id
-        } catch (ignored2) {
-            return ''
-        }
-    }
-}
-
-// Containers, and block placing (the PRIMARY gate for placing).
+// Containers, and grazing.
 //
 // BlockEvents.rightClicked is NeoForge's PlayerInteractEvent.RightClickBlock, posted
-// once per hand with that hand's stack as event.item, so "is the player placing a
-// block" is exact here. Cancelling denies the interaction server-side: nothing is
-// placed, nothing is consumed. (On 1.20.1 the placement cancel sat inside a try,
-// which caught the exit and un-cancelled it -- the likely real cause of the
-// "inconsistent" placement denial recorded then.)
+// once per hand with that hand's stack as event.item. Cancelling denies the
+// interaction server-side: nothing opens. (On 1.20.1 the cancel sat inside a try,
+// which caught the exit and un-cancelled it.)
 //
 // Refused through hasEffect(), which checks liberation. The 1.20.1 handler read the
 // realm's effects directly and so still refused a LIBERATED animal-born player.
@@ -418,7 +831,10 @@ BlockEvents.rightClicked(event => {
     const player = event.player
     if (!player) return
 
-    // 1. Containers and workstations: refuse opening them at all.
+    // 1. Grazing (an animal's mouth on the grass) -- never a container, so first.
+    if (global.SMS.graze(player, event)) return
+
+    // 2. Containers and workstations: refuse opening them at all.
     if (hasEffect(player, 'noContainers')) {
         var id = ''
         try {
@@ -427,70 +843,132 @@ BlockEvents.rightClicked(event => {
             id = ''
         }
         if (id && isContainerBlock(id)) {
-            refuse(player, 'An animal cannot work that.')
+            refuse(player, beingOf(player) + ' cannot work that.')
             event.cancel()
         }
     }
-
-    // 2. Block placing: refuse when the item in THIS hand is a block. Food, tools,
-    //    weapons and buckets stay usable, so an animal can still eat, dig and fight.
-    //    (Holding a block also means doors and levers cannot be worked with that hand.)
-    if (hasEffect(player, 'noBlockPlacing') && isBlockItemStack(event.item)) {
-        refuse(player, 'An animal cannot place blocks.')
-        event.cancel()
-    }
 })
 
-// SECOND LINE OF DEFENCE for placing: refuse a placement the interaction gate missed.
+// ---- Picking up: a ghost holds only food, an animal only what it eats --------
 //
-// On KubeJS 7 this is NeoForge's BlockEvent.EntityPlaceEvent, and cancelling it makes
-// CommonHooks.onPlaceItemIntoWorld restore the block snapshot AND leave the item stack
-// at its pre-use count -- a clean refusal with the refund built in, safe in creative
-// (read from the jar). On 1.20.1 it was a notification only, which is why the old
-// version reverted to air and could not refund.
-//
-// BUT NeoForge fires this event for EVERY block change made through an item's useOn,
-// except buckets: a hoe's farmland, an axe's stripped log, a shovel's path, fire from
-// flint and steel, a crop grown by bone meal. Refusing all of them would take an
-// animal's tools away. So this refuses only a placement whose block a held block item
-// actually places. (Wall variants -- a wall torch from a torch -- do not match here;
-// the interaction gate above catches those.)
-//
-// event.entity is null for a dispenser and non-player for an enderman; hasEffect()
-// returns false for both, so a machine's placement is never refused on a player's
-// behalf.
-BlockEvents.placed(event => {
-    const player = event.entity
-    if (!hasEffect(player, 'noBlockPlacing')) return
+// KubeJS 7's ItemEvents.canPickUp is NeoForge's ItemEntityPickupEvent.Pre, and its
+// cancel() sets canPickup to FALSE (KubeJSItemEventHandler.itemPickupPre ->
+// EventResult.applyTristate; read from the jar). The event is ItemPickedUpKubeEvent:
+// getEntity() is the PLAYER (as on entityInteracted, N9) and getItem() the stack --
+// read through those explicit getters, since its `entity` FIELD is the item entity.
+// It fires every tick the player stands on an item, so the refusal is silent.
 
-    var placedId = ''
+// Item tags for meat, built once from config.animalBirth.meat.tags.
+var meatTagKeys = null
+function meatTags() {
+    if (meatTagKeys !== null) return meatTagKeys
+    meatTagKeys = []
     try {
-        placedId = '' + event.block.id
+        var TagKeyClass = Java.loadClass('net.minecraft.tags.TagKey')
+        var RegistriesClass = Java.loadClass('net.minecraft.core.registries.Registries')
+        var ids = ((global.SMS.config.animalBirth || {}).meat || {}).tags || []
+        for (var i = 0; i < ids.length; i++) meatTagKeys.push(TagKeyClass.create(RegistriesClass.ITEM, ResourceLocationClass.parse(ids[i])))
+    } catch (e) {
+        console.warn(`[Samsara] could not build the meat tags; only the listed meat ids count: ${e}`)
+    }
+    return meatTagKeys
+}
+
+function isMeat(stack) {
+    try {
+        if ((((global.SMS.config.animalBirth || {}).meat || {}).items || []).indexOf('' + stack.id) !== -1) return true
+        var tags = meatTags()
+        for (var i = 0; i < tags.length; i++) {
+            if (stack.is(tags[i])) return true
+        }
+    } catch (ignored) {
+        // unreadable stack: not meat
+    }
+    return false
+}
+
+function isFood(stack, player) {
+    try {
+        return !!stack.getFoodProperties(player)
+    } catch (ignored) {
+        return false
+    }
+}
+
+// May this player pick this stack up? True whenever no rule applies.
+global.SMS.mayPickUp = (player, stack) => {
+    if (!player || !stack) return true
+    try {
+        if (!player.isPlayer() || global.SMS.isLiberated(player)) return true
+    } catch (ignored) {
+        return true
+    }
+    const fx = global.SMS.effectsFor(global.SMS.birthRealmOf(player))
+    var rule = fx.pickUp
+    if (rule === 'diet') rule = ((global.SMS.config.animalBirth || {}).pickUpByDiet || {})[dietOfPlayer(player)] || 'meat'
+    if (rule === 'none') return false
+    if (rule === 'food') return isFood(stack, player)
+    if (rule === 'meat') return isMeat(stack)
+    return true
+}
+
+ItemEvents.canPickUp(event => {
+    var player = null
+    var stack = null
+    try {
+        player = event.getEntity()
+        stack = event.getItem()
     } catch (ignored) {
         return
     }
-    var fromHeld = false
-    try {
-        fromHeld = placedIdOf(player.getMainHandItem()) === placedId
-    } catch (ignored2) {
-        fromHeld = false
-    }
-    if (!fromHeld) {
-        try {
-            fromHeld = placedIdOf(player.getOffhandItem()) === placedId
-        } catch (ignored3) {
-            fromHeld = false
-        }
-    }
-    if (!fromHeld) return
-
-    refuse(player, 'An animal cannot place blocks.')
+    if (global.SMS.mayPickUp(player, stack)) return
     event.cancel()
 })
 
+// ---- Birth: say what the new life's rules are ---------------------------------
+//
+// Called by samsara_rebirth.js after a rebirth and by /karma realm -- a BIRTH, never a
+// login. Nobody can guess "right-click grass to eat" from the HUD.
+
+// Was this birth anchored at the player's last human death (samsara_rebirth.js)?
+function hauntsGrave(player) {
+    try {
+        return !!(global.SMS.graveAnchor && global.SMS.graveAnchor(player, 'preta'))
+    } catch (ignored) {
+        return false
+    }
+}
+global.SMS.tellBirthRules = player => {
+    try {
+        if (global.SMS.isLiberated(player)) return
+        var realm = global.SMS.birthRealmOf(player)
+        var lines = []
+        if (realm === 'preta') {
+            var life = global.SMS.effectsFor('preta').life
+            lines = [
+                'You are born a hungry ghost' + (hauntsGrave(player) ? ', where you last died as a human.' : '.'),
+                '  Nothing can harm you, and nothing hunts you. This life lasts ' + (life ? minutesSeconds(life.ticks) : '?') + ', as long as your Hungry Ghost.',
+                '  You can hold only food, and each meal is one crumb. Go hungry, then eat until full, and half of what remains falls away.',
+                '  You cannot build, break, open containers, or open a grave. When the craving is spent you are human again, and your grave is yours.',
+            ]
+        } else if (realm === 'animal') {
+            var diet = dietOfPlayer(player)
+            lines = ['You are born an animal (' + diet + ').']
+            if (diet !== 'carnivore') lines.push('  Graze: right-click grass with an empty hand.')
+            if (diet !== 'herbivore') lines.push('  You can pick up and eat only meat.')
+            if (diet === 'herbivore') lines.push('  You can pick up nothing. A herbivore that lets a predator take it, without fighting back, gives the gift of its body.')
+            lines.push('  You cannot build, break, craft, or open containers.')
+        }
+        for (var i = 0; i < lines.length; i++) player.tell(i === 0 ? Text.yellow(lines[i]) : Text.gray(lines[i]))
+    } catch (ignored) {
+        // messaging is best-effort
+    }
+}
+
 // ---- Preta (hungry ghost) realm --------------------------------------------
 //
-// A huge belly and a pinhole mouth: food the preta eats for ITSELF barely registers.
+// A huge belly and a pinhole mouth: every meal the preta eats is ONE crumb
+// (foodPerMeal), whatever the food -- decided 2026-10-22, replacing the 0.2 multiplier.
 // Once feeding others exists (design doc 7), giving food away will be the efficient
 // way to eat, and generosity becomes the escape route rather than a side activity.
 //
@@ -499,23 +977,29 @@ BlockEvents.placed(event => {
 // getFoodData().eat(food) FIRST and only then super.eat(). So for a PLAYER this
 // handler sees the bar AFTER the meal. The 1.20.1 version took a "pre-meal" snapshot
 // here, measured gained = 0 on the next tick and left through "no measurable gain":
-// the multiplier never applied. The 3-icon cap landed the bar on 3 either way, which
-// is what hid it.
+// the multiplier never applied.
 //
 // THE MEAL IS READABLE on 1.21.1: Item.finishUsingItem passes exactly
 // stack.getFoodProperties(entity) to eat(), FoodProperties.nutrition() is a plain
 // accessor, and the stack is not consumed until later in LivingEntity.eat(). So the
-// correction is exact and immediate -- no queue, no cross-tick state, nothing that
-// could land on the next body after a death.
+// correction is exact and immediate -- no queue, nothing that could land on the next
+// body after a death.
+//
+// EXCEPT WHEN VANILLA CLAMPED THE BAR AT 20. Then `bar - nutrition` reads LOW: a preta
+// on 19 eating a steak (8) is left on 20, and backing out 8 gives 12 -- the "crumb"
+// would TAKE six points. The 3-icon cap made that unreachable; without the cap it is
+// the common case. So the preta tick records the bar every pass
+// (global.SMS.pretaLastFood), and a meal that ends on 20 backs out to that instead.
+// The bar only falls between passes (hunger, exertion), so the record is never low --
+// at worst one point high, which can only ever give the preta a point, never take one.
 //
 // Writers of foodLevel, in tick order (the project notes: enumerate the writers before
 // constraining a value): vanilla FoodData.tick (exhaustion and regen; the hunger
 // effect adds exhaustion) -> vanilla FoodData.eat (the meal) -> THIS correction,
-// inside the same eat() call -> the preta clamp below (every 4 ticks, DOWN only). The
-// correction undoes what the meal did; the clamp then enforces the standing ceiling
-// on the result. Because the correction runs inside eat(), that order is inherent,
-// not a matter of handler registration -- and with no drain left for the clamp to
-// eat, the 2026-10-18 "clamp swallows the drain" failure cannot recur.
+// inside the same eat() call. The preta tick below only READS the bar (the record,
+// and the halving's re-arm). Nothing clamps it any more.
+global.SMS.pretaLastFood = global.SMS.pretaLastFood || {}
+
 ItemEvents.foodEaten(event => {
     // DIAGNOSTIC LOGGING (config.debugFood). Every exit path below is logged when it
     // is on, because every one of them is a SILENT return: the old version of this
@@ -535,7 +1019,7 @@ ItemEvents.foodEaten(event => {
     }
 
     // Liberation turns realm penalties off. This handler cannot use hasEffect()
-    // because foodMultiplier is a NUMBER, not a boolean flag, so it needs its own
+    // because foodPerMeal is a NUMBER, not a boolean flag, so it needs its own
     // guard -- the preta food penalty would otherwise outlive liberation.
     try {
         if (global.SMS.isLiberated(player)) {
@@ -548,13 +1032,9 @@ ItemEvents.foodEaten(event => {
 
     const realm = global.SMS.birthRealmOf(player)
     const fx = global.SMS.effectsFor(realm)
-    const mult = fx.foodMultiplier
-    if (mult === undefined || mult >= 1) {
-        if (dbg) {
-            console.info(
-                `[Samsara] foodEaten: born-${realm} has no foodMultiplier (${mult}); full meal`
-            )
-        }
+    const per = fx.foodPerMeal
+    if (per === undefined) {
+        if (dbg) console.info(`[Samsara] foodEaten: born-${realm} has no foodPerMeal; full meal`)
         return
     }
 
@@ -590,54 +1070,52 @@ ItemEvents.foodEaten(event => {
         return
     }
 
+    const key = '' + player.uuid
     try {
-        // Back out the meal, then keep the preta's share. `cur - nutrition` is exact
-        // unless vanilla clamped the bar at 20 (pre + nutrition > 20); then it reads
-        // LOW, which only ever costs the preta, never feeds it. A capped preta sits
-        // at <= foodCap, so that needs a 15-point food.
+        // Back out the meal, then keep the crumb.
         var pre = cur - nutrition
+        if (cur >= 20) {
+            // Vanilla clamped the meal at 20: back out to the bar last seen instead.
+            var snap = Number(global.SMS.pretaLastFood[key])
+            if (isFinite(snap) && snap > pre && snap <= 20) pre = snap
+        }
         if (pre < 0) pre = 0
-        // FLOOR, not round, so the penalty can never round UP into a free point. A
-        // meal worth less than 1/mult points therefore feeds a preta nothing at all,
-        // which is the intent.
-        var kept = Math.floor(nutrition * mult)
+        var kept = Math.min(per, nutrition)
         var next = pre + kept
         if (next > cur) next = cur // never ADD food
-        player.setFoodLevel(Math.floor(next))
+        next = Math.floor(next)
+        player.setFoodLevel(next)
+        global.SMS.pretaLastFood[key] = next
 
         if (dbg) {
             console.info(
                 `[Samsara] preta meal: ${player.profile.name} nutrition ${nutrition}` +
-                    ` -> kept ${kept} (mult ${mult}); food ${cur} -> ${Math.floor(next)}`
+                    ` -> kept ${kept}; food ${cur} -> ${next}`
             )
         }
+
+        // A full belly halves what is left of the life (if it has gone hungry since).
+        if (next >= 20 && fx.life) halvePretaLife(player, fx.life)
     } catch (e) {
         console.warn(`[Samsara] foodEaten: preta correction failed: ${e}`)
     }
 })
 
-// ---- The preta tick: the clamp ----------------------------------------------
-//
-// Only the clamp runs on the tick now: the meal itself is corrected inside foodEaten.
+// ---- The preta tick: hunger, the bar record, the life clock --------------------
 ServerEvents.tick(event => {
     global.SMS.pretaCounter++
     if (global.SMS.pretaCounter >= PRETA_INTERVAL_TICKS) {
         global.SMS.pretaCounter = 0
-        global.SMS.enforcePretaHunger(event.server)
+        global.SMS.pretaTick(event.server)
     }
 })
 
-// ---- Preta: a capped hunger bar and a permanent hunger effect ----------------
-//
-// The design: a hungry ghost's bar never rises past `foodCap` (3 icons = 6 points)
-// and they carry minecraft:hunger permanently. Together with foodMultiplier above,
-// eating is close to pointless for a preta -- which is the realm's whole character.
-//
-// WHY A CEILING ON A TIMER, NOT A ONE-SHOT SET. Setting foodLevel once at rebirth
-// does nothing lasting: the next meal refills the bar, and vanilla's own regen and
-// the respawn both reset it to 20. The cap therefore has to be re-enforced. It runs
-// on a timer rather than every tick because it is a clamp, not a reaction -- there is
-// nothing to miss by checking 5x/second instead of 20x.
+// Every PRETA_INTERVAL_TICKS, for each online player born into a realm with these
+// effects:
+//   1. record the bar, for the meal correction above (foodPerMeal);
+//   2. renew the permanent hunger effect before it lapses (hungerEffect);
+//   3. run the life clock (life): re-arm the halving, count down, re-give the effects
+//      about once a second, and end the life when it runs out.
 //
 // WHY /effect AND NOT getPotionEffects().add(). Jar-verified 2026-10-18 on KubeJS 6:
 // EntityPotionEffectsJS.add's overloads all take a net.minecraft MobEffect OBJECT
@@ -646,12 +1124,13 @@ ServerEvents.tick(event => {
 // so Rhino had nothing to coerce 'minecraft:hunger' with. That is project trap 8
 // (overloads must match exactly) and it fails silently. runCommandSilent takes a
 // plain String on KubeJS 6 and 7 alike, and /effect's syntax is unchanged in 1.21.1,
-// so the command stays the seam.
+// so the command stays the seam -- run through global.SMS.serverCommand, because
+// /effect is op-level and a player's OWN runCommandSilent is not (J39).
 //
 // NOTE the /effect command takes SECONDS, while the config carries TICKS (every other
 // duration in this pack is in ticks, and mixing the two units is how this goes wrong
-// silently). The conversion happens here, once.
-global.SMS.enforcePretaHunger = server => {
+// silently). The conversion happens where the command is built, once.
+global.SMS.pretaTick = server => {
     var players = null
     try {
         players = server.players
@@ -677,9 +1156,9 @@ global.SMS.enforcePretaHunger = server => {
         }
         if (!player) continue
 
-        // Liberation turns realm penalties off. foodCap and hungerEffect are a number
-        // and an object, not boolean flags, so hasEffect() does not cover them and
-        // they need the same explicit guard the food multiplier does.
+        // Liberation turns realm penalties off. These effects are numbers and objects,
+        // not boolean flags, so hasEffect() does not cover them and they need the same
+        // explicit guard the meal does.
         var freed = false
         try {
             freed = global.SMS.isLiberated(player)
@@ -696,20 +1175,13 @@ global.SMS.enforcePretaHunger = server => {
         }
         if (!fx) continue
 
-        // 1. Clamp the hunger bar DOWN to the cap. Never raises it: a starving preta
-        //    who has fallen below the cap stays where they are.
-        if (fx.foodCap !== undefined) {
+        // 1. The bar, as last seen.
+        if (fx.foodPerMeal !== undefined) {
             try {
-                var cur2 = Number(player.foodLevel)
-                if (isFinite(cur2) && cur2 > fx.foodCap) {
-                    player.setFoodLevel(Math.floor(fx.foodCap))
-                    // Saturation above the cap would refill the bar straight back up,
-                    // so it goes too -- vanilla drains saturation before food.
-                    var sat2 = Number(player.saturation)
-                    if (isFinite(sat2) && sat2 > 0) player.setSaturation(0)
-                }
+                var bar = Number(player.foodLevel)
+                if (isFinite(bar)) global.SMS.pretaLastFood['' + player.uuid] = bar
             } catch (ignored) {
-                // food members unreadable; skip this player this pass
+                // unreadable this pass; the meal falls back to backing out the meal
             }
         }
 
@@ -722,15 +1194,115 @@ global.SMS.enforcePretaHunger = server => {
                 var amp = Number(he.amplifier)
                 if (!isFinite(amp) || amp < 0) amp = 0
                 // `true` is hideParticles: a permanent effect should not fog the
-                // screen with particles forever.
-                player.runCommandSilent(
-                    'effect give @s ' + he.id + ' ' + seconds + ' ' + amp + ' true'
+                // screen with particles forever. At server permission: /effect is
+                // op-level (see global.SMS.serverCommand).
+                global.SMS.serverCommand(
+                    player, 'effect give @s ' + he.id + ' ' + seconds + ' ' + amp + ' true'
                 )
             } catch (ignored) {
                 // command seam unavailable; nothing else to try
             }
         }
+
+        // 3. The life clock.
+        if (fx.life) {
+            try {
+                pretaLifeStep(player, fx.life, PRETA_INTERVAL_TICKS)
+            } catch (e) {
+                console.warn(`[Samsara] preta life step failed for ${player.profile.name}: ${e}`)
+            }
+        }
     }
+}
+
+// ---- Preta: nothing can harm a ghost (realmEffects.preta.noDamage) -------------
+//
+// NeoForge's EntityInvulnerabilityCheckEvent is posted from the end of vanilla
+// Entity.isInvulnerableTo (CommonHooks.isEntityInvulnerableTo; read from the NeoForge
+// 21.1.264 jar), and Player.hurt / LivingEntity.hurt ask isInvulnerableTo FIRST -- so
+// a refused source never reaches LivingIncomingDamageEvent, karma's damage hook. Two
+// consequences, both intended: starving costs a preta no health, and hostile hits on a
+// preta open no endurance encounter (a ghost cannot earn metta by enduring harm).
+//
+// The sources in minecraft:bypasses_invulnerability -- out_of_world (the void) and
+// generic_kill (/kill) -- are let through, as vanilla
+// lets them through creative mode.
+//
+// This is a separate seam from the damage hook on purpose: the hard rule is that
+// Samsara never cancels or edits LivingIncomingDamageEvent. Nothing is stored, so
+// nothing needs teardown: it follows birthRealm and liberation live. The event fires
+// on the client thread too (one event bus on an integrated server), so the client side
+// is skipped before anything is read: a client entity has no server (ClientLevel does
+// not override Level.getServer(), which returns null).
+//
+// Two members are avoided on purpose: the event's isInvulnerable() and Level's
+// isClientSide() each share their name with a FIELD (boolean isInvulnerable, boolean
+// isClientSide), and how KubeJS's Rhino resolves a field/method name clash is unprobed.
+// Setting invulnerable on an entity that already is one is harmless.
+var ghostGuardWarned = false
+global.SMS.ghostGuard = event => {
+    const entity = event.getEntity()
+    if (!entity || !entity.isPlayer()) return false
+    if (!entity.getServer()) return false
+    if (!hasEffect(entity, 'noDamage')) return false
+    const source = event.getSource()
+    if (!source || !DamageTypeTagsClass || source.is(DamageTypeTagsClass.BYPASSES_INVULNERABILITY)) return false
+    event.setInvulnerable(true)
+    return true
+}
+
+// The registration is in a try: a top-level throw here would abort the rest of this
+// file. A failure inside the listener warns ONCE -- it fires on every damage check.
+try {
+    NativeEvents.onEvent(Java.loadClass('net.neoforged.neoforge.event.entity.EntityInvulnerabilityCheckEvent'), event => {
+        try {
+            global.SMS.ghostGuard(event)
+        } catch (e) {
+            if (!ghostGuardWarned) {
+                ghostGuardWarned = true
+                console.warn(`[Samsara] preta invulnerability check failed (pretas can be hurt): ${e}`)
+            }
+        }
+    })
+} catch (e) {
+    console.error(`[Samsara] could not register the preta invulnerability hook -- pretas can be hurt: ${e}`)
+}
+
+// ---- Preta: nothing hunts a ghost (realmEffects.preta.ignoredByMobs) -------------------
+//
+// NeoForge's LivingChangeTargetEvent (read from neoforge-21.1.264): CommonHooks posts it
+// from Mob.setTarget (MOB_TARGET) and from the brain behaviour StartAttacking
+// (BEHAVIOR_TARGET: piglins, hoglins and the like), and BOTH then apply
+// getNewAboutToBeSetTarget() -- Mob into its target field, StartAttacking into the
+// ATTACK_TARGET memory, which it erases for null. So setting the new target to NULL makes
+// the mob target nothing; cancelling would keep whatever it targeted before. A mob whose
+// AI sets its target some other way would still come -- harmlessly, since the ghost guard
+// lets no hit through.
+//
+// This replaces Tombstone's Ghostly Shape for pretas (its tick refills the food bar). Like
+// the ghost guard it follows birthRealm and liberation live, so nothing needs teardown.
+var ghostTargetWarned = false
+global.SMS.ghostUntargetable = event => {
+    const target = event.getNewAboutToBeSetTarget()
+    if (!target || !target.isPlayer()) return false
+    if (!hasEffect(target, 'ignoredByMobs')) return false
+    event.setNewAboutToBeSetTarget(null)
+    return true
+}
+
+try {
+    NativeEvents.onEvent(Java.loadClass('net.neoforged.neoforge.event.entity.living.LivingChangeTargetEvent'), event => {
+        try {
+            global.SMS.ghostUntargetable(event)
+        } catch (e) {
+            if (!ghostTargetWarned) {
+                ghostTargetWarned = true
+                console.warn(`[Samsara] preta targeting check failed (mobs can hunt pretas): ${e}`)
+            }
+        }
+    })
+} catch (e) {
+    console.error(`[Samsara] could not register the preta targeting hook -- mobs can hunt pretas: ${e}`)
 }
 
 // SECOND LINE OF DEFENCE FOR CONTAINERS.
@@ -758,7 +1330,8 @@ PlayerEvents.inventoryOpened(event => {
     if (!player) return
     if (!hasEffect(player, 'noContainers')) return
 
-    // The player's OWN inventory must stay usable -- an animal still carries items.
+    // The player's OWN inventory must stay usable -- an animal or a ghost still carries
+    // what it picked up.
     // (The server never sends an "open" for it, so this is belt and braces.) Tested
     // with instanceof against the vanilla class: the 1.20.1 test read the class NAME
     // through getClass(), which KubeJS's class filter may not allow.
@@ -774,7 +1347,7 @@ PlayerEvents.inventoryOpened(event => {
 
     try {
         player.closeMenu()
-        refuse(player, 'An animal cannot work that.')
+        refuse(player, beingOf(player) + ' cannot work that.')
     } catch (e) {
         // closeMenu unavailable: the rightClicked cancel is the only protection.
     }
