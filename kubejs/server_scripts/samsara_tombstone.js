@@ -7,8 +7,8 @@
 // ground as vanilla drops them -- and in any other birth the player does not hold a grave
 // key: Samsara keeps it (nbt.graveKeys) and gives it back at the next human life. So the
 // only grave and key that ever exist are a human's, however many births ago that was. A
-// preta, born at that grave (samsara_rebirth.js), gets its key back the moment its craving
-// is spent and it is human again (samsara_realms.js).
+// preta, born at that grave (samsara_rebirth.js), gets its key back only if it is reborn
+// human (its life ends in old age, like every other -- config.aging).
 //
 // PRIORITY 30: no load-order dependency. Everything here reads birthRealm when it RUNS
 // (a respawn's key sync is queued for the next tick), and global.SMS.refuse comes from
@@ -27,6 +27,10 @@
 //     refuse it with). The key teleports to the grave, across dimensions.
 //   - ItemStack.save(HolderLookup.Provider) / ItemStack.parseOptional(Provider,
 //     CompoundTag) round-trip a stack; Entity.registryAccess() is the provider.
+//   - A key is ENCHANTED (hold right-click: carried to the grave) when its tb_enchanted
+//     data component is true: ItemGraveKey.isEnchanted reads ModDataComponents.ENCHANTED
+//     (a Boolean, default false), and setEnchant writes it. KubeJS's
+//     ComponentFunctions.override(DataComponentType, Object) sets a component directly.
 //
 // Nothing here runs without the mod (Platform.isLoaded).
 
@@ -105,8 +109,37 @@ function keepFromInventory(player) {
     return moved
 }
 
-// Every kept key back into the inventory -- or at the player's feet, if it is full.
-// Returns how many.
+// Tombstone's ENCHANTED component type, loaded once (null when it cannot be: the keys
+// then come back plain, and the warning says so once).
+var enchantedType = undefined
+function enchantedComponent() {
+    if (enchantedType !== undefined) return enchantedType
+    enchantedType = null
+    try {
+        enchantedType = Java.loadClass('ovh.corail.tombstone.registry.ModDataComponents').ENCHANTED || null
+    } catch (e) {
+        console.warn(`[Samsara] could not load Tombstone's enchanted-key component; returned keys stay plain: ${e}`)
+    }
+    return enchantedType
+}
+
+// Make a returned key the enchanted kind (config.graves.enchantReturnedKeys, decided
+// 2026-10-24, the user): every key Samsara hands back can carry its owner to the grave.
+function enchantKey(stack) {
+    if (global.SMS.config.graves.enchantReturnedKeys !== true) return false
+    const type = enchantedComponent()
+    if (!type) return false
+    try {
+        stack.override(type, true)
+        return true
+    } catch (e) {
+        console.warn(`[Samsara] could not enchant a returned grave key: ${e}`)
+        return false
+    }
+}
+
+// Every kept key back into the inventory -- or at the player's feet, if it is full --
+// enchanted (enchantKey). Returns how many.
 function giveBack(player) {
     const keep = keepOf(player)
     const n = keptCount(keep)
@@ -118,6 +151,7 @@ function giveBack(player) {
         keep.remove('k' + i)
         var stack = itemStacks().parseOptional(access, saved)
         if (!stack || stack.isEmpty()) continue
+        enchantKey(stack)
         if (!player.getInventory().add(stack)) player.drop(stack, false)
         given++
     }
@@ -149,15 +183,19 @@ global.SMS.graves = {
     // ItemEntities are already placed and moving -- and the event is cancelled, which is
     // what stops Tombstone (LOW, receiveCanceled) from making a grave. Returns whether it
     // acted.
+    // EVERYTHING that can throw runs BEFORE the cancel: once the event is cancelled, the
+    // items exist nowhere but in `items`, so a throw after it deletes them. That happened
+    // in game on 2026-10-24 -- vanilla's level() (shadowed by KubeJS's `level` bean, N9)
+    // threw right after the cancel, and 16 non-human deaths lost everything they carried.
     onDrops: event => {
         const player = event.getEntity()
         if (!player || !player.isPlayer()) return false
         if (!tombstoneLoaded() || humanLife(player)) return false
+        const level = player.getLevel()
         const items = []
         const it = event.getDrops().iterator()
         while (it.hasNext()) items.push(it.next())
         event.setCanceled(true)
-        const level = player.level()
         var kept = 0
         var dropped = 0
         for (var i = 0; i < items.length; i++) {
@@ -192,7 +230,7 @@ try {
             try {
                 global.SMS.graves.onDrops(event)
             } catch (e) {
-                console.warn(`[Samsara] grave veto failed (a non-human death may leave a grave): ${e}`)
+                console.warn(`[Samsara] grave veto failed (a non-human death may leave a grave, or lose its items): ${e}`)
             }
         }
     )

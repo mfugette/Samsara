@@ -1,0 +1,13 @@
+{
+  "replace": false,
+  "values": [
+    "samsara:deva_ocean",
+    "samsara:deva_beach",
+    "samsara:deva_river",
+    "samsara:deva_plains",
+    "samsara:deva_meadow",
+    "samsara:deva_forest",
+    "samsara:deva_mountains",
+    "samsara:deva_snowy_peaks"
+  ]
+}

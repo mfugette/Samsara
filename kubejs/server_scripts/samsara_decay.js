@@ -136,15 +136,22 @@ global.SMS.rapidDeathStreak = player => {
 // death ADDS falls off on the same streak (samsara_karma.js) -- see
 // rapidDeathStreak above.
 //
+// `opts.oldAge`: a death by OLD AGE -- Aging ran out (samsara_realms.js, 2026-10-25). It
+// ripens at full rate (the falloff is for deaths in quick succession, and a life that ran
+// its course is not one) and records NO death in the streak, so the next death is not
+// read as a rapid repeat of it -- no extra delusion, no reduced ripening. (The deva's fall
+// without a death passed the same as `notADeath`, 2026-10-24; the fall is retired.)
+//
 // Returns a small report for logging, or null when ripening is off.
-global.SMS.ripenKarma = (player, realm) => {
+global.SMS.ripenKarma = (player, realm, opts) => {
     const cfg = global.SMS.config.ripening
     if (!cfg.enabled) return null
 
     const nbt = global.SMS.config.nbt
     const tag = global.SMS.persistedTag(player)
     const now = global.SMS.tickClock || 0
-    const streak = global.SMS.rapidDeathStreak(player)
+    const oldAge = !!(opts && opts.oldAge)
+    const streak = oldAge ? 0 : global.SMS.rapidDeathStreak(player)
 
     // The falloff multiplier applied to every rate below.
     const falloff = Math.pow(cfg.repeatFalloff, streak)
@@ -198,15 +205,17 @@ global.SMS.ripenKarma = (player, realm) => {
         global.SMS.setCombatHatred(player, combatBefore * (hatredAfter / hatredBefore))
     }
 
-    // Record the death for the next falloff calculation.
-    tag.putDouble(nbt.lastDeathTick, now)
-    tag.putBoolean(nbt.everDied, true)
-    tag.putDouble(nbt.deathStreak, streak + 1)
+    // Record the death for the next falloff calculation -- unless it was old age.
+    if (!oldAge) {
+        tag.putDouble(nbt.lastDeathTick, now)
+        tag.putBoolean(nbt.everDied, true)
+        tag.putDouble(nbt.deathStreak, streak + 1)
+    }
 
     const shown = Math.round(removed * 100) / 100
     console.info(
         `[Samsara] ripening (${realmKey}): ${player.profile.name} spent ${shown} karma` +
-            ` [${detail}, rapid-death streak ${streak}]`
+            ` [${detail}, ` + (oldAge ? 'old age' : `rapid-death streak ${streak}`) + ']'
     )
 
     return { removed: shown, realm: realmKey, streak: streak, detail: detail }

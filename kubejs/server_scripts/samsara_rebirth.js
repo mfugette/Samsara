@@ -194,6 +194,39 @@ function seesSky(block) {
     return null
 }
 
+// Would a player standing at (x,y,z) -- floor at y-1 -- be over the void? (decided
+// 2026-10-25, the user: "make sure that we never spawn over a void, even with the stone
+// block platform".) Two tests, both from config.safeSpawn:
+//   groundDepth  the floor and the blocks under it, that many in all, are not air -- a
+//                one-block sliver of an island (or the old fallback's lone stone block in
+//                mid-air) fails;
+//   edgeDrop     each of the four neighbouring columns holds something within edgeDrop
+//                blocks under the floor's level -- the lip of an island, or a pillar,
+//                fails; ordinary ground, a slope, a step or a lake shore passes (water is
+//                not air).
+// Only air counts as nothing: this asks "is there anything under me", not "is it good".
+function overVoid(level, x, y, z) {
+    const sp = global.SMS.config.safeSpawn
+    var depth = sp.groundDepth || 0
+    for (var d = 2; d <= depth; d++) {
+        if (isClear(level.getBlock(x, y - d, z))) return true
+    }
+    var drop = sp.edgeDrop || 0
+    if (drop <= 0) return false
+    var sides = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+    for (var i = 0; i < sides.length; i++) {
+        var held = false
+        for (var k = 1; k <= drop + 1; k++) {
+            if (!isClear(level.getBlock(x + sides[i][0], y - k, z + sides[i][1]))) {
+                held = true
+                break
+            }
+        }
+        if (!held) return true
+    }
+    return false
+}
+
 // Is (x,y,z) a place a player can be reborn standing up?
 // `skyMode`: 'require' (surface realms), 'ignore' (cavern realms).
 function isValidStand(level, x, y, z, skyMode) {
@@ -209,6 +242,8 @@ function isValidStand(level, x, y, z, skyMode) {
         // never silently accept a cave.
         if (sky !== true) return false
     }
+    // Last, so it costs reads only for a spot that is otherwise good.
+    if (overVoid(level, x, y, z)) return false
     return true
 }
 
@@ -611,7 +646,9 @@ function findRebirthSpot(level, realm, anchor, dimId) {
 // where a realm in config.graves.bornAtGrave is born. Recorded by the death handler below,
 // from the DYING life's birthRealm -- the respawn handler writes the new one only later.
 // Overwritten only by the next human death, so it survives any number of other births.
-// Explicit vanilla getters (N9): getX/Y/Z, level().dimension().location().
+// Explicit getters (N9): getX/Y/Z, and KubeJS's getLevel().getDimension() -- NOT vanilla's
+// level(): KubeJS's `level` bean shadows that method, and calling it threw "Cannot call
+// property level" on every death in game (2026-10-24), so no human death was recorded.
 global.SMS.recordHumanDeath = player => {
     if (global.SMS.birthRealmOf(player) !== 'human') return false
     const nbt = global.SMS.config.nbt
@@ -619,7 +656,7 @@ global.SMS.recordHumanDeath = player => {
     tag.putDouble(nbt.humanDeathX, Math.floor(Number(player.getX())))
     tag.putDouble(nbt.humanDeathY, Math.floor(Number(player.getY())))
     tag.putDouble(nbt.humanDeathZ, Math.floor(Number(player.getZ())))
-    tag.putString(nbt.humanDeathDim, '' + player.level().dimension().location())
+    tag.putString(nbt.humanDeathDim, '' + player.getLevel().getDimension())
     tag.putBoolean(nbt.humanDeathSet, true)
     return true
 }
@@ -644,27 +681,263 @@ global.SMS.graveAnchor = (player, realm) => {
     return { x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) }
 }
 
-// Where to search around. Rebirth means losing your place in the world, so this is the
-// realm's configured spawn -- never the death position, which made a same-realm death
-// indistinguishable from a vanilla respawn -- with ONE exception: a realm born at its
-// grave (graveAnchor above) anchors on the last HUMAN death, which is a different life's
-// place, not the death that just happened.
-global.SMS.rebirthAnchor = (player, realm) => {
+// Vanilla classes the anchors use, loaded once (read from the 1.21.1 jars, 2026-10-25;
+// net.minecraft is open to scripts, J47). Each is null when it cannot be loaded, and its
+// user falls back and says so.
+function loadAnchorClass(name) {
+    try {
+        return Java.loadClass(name)
+    } catch (e) {
+        console.warn(`[Samsara] could not load ${name}: ${e}`)
+        return null
+    }
+}
+const HeightmapTypes = loadAnchorClass('net.minecraft.world.level.levelgen.Heightmap$Types')
+const BlockPosClass = loadAnchorClass('net.minecraft.core.BlockPos')
+const TagKeyClass = loadAnchorClass('net.minecraft.tags.TagKey')
+const RegistriesClass = loadAnchorClass('net.minecraft.core.registries.Registries')
+const AnchorResourceLocation = loadAnchorClass('net.minecraft.resources.ResourceLocation')
+
+// The world's own spawn: Level.getSharedSpawnPos(), where vanilla put the world's first
+// spawn -- on land (it searches for it). Read from the Overworld; null if unreadable.
+// In game 2026-10-25 it was -272,123,384 while 0,0 -- the old human anchor -- was ocean,
+// and every Overworld birth fell through to a cave at y -15.
+global.SMS.worldSpawn = server => {
+    try {
+        var p = server.getLevel('minecraft:overworld').getSharedSpawnPos()
+        var x = Number(p.getX())
+        var y = Number(p.getY())
+        var z = Number(p.getZ())
+        if (isFinite(x) && isFinite(y) && isFinite(z)) return { x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) }
+    } catch (e) {
+        console.warn(`[Samsara] the world spawn is unreadable; using realmSpawns: ${e}`)
+    }
+    return null
+}
+
+// The surface at x,z: the first open block above the highest motion-blocking one (vanilla
+// heightmap MOTION_BLOCKING_NO_LEAVES -- water counts, leaves do not), so a birth found by
+// biome starts its search where the ground is. Loads the chunk, as the search would.
+function surfaceY(level, x, z) {
+    if (!HeightmapTypes) return null
+    try {
+        var h = Number(level.getHeight(HeightmapTypes.MOTION_BLOCKING_NO_LEAVES, x, z))
+        return isFinite(h) ? Math.floor(h) : null
+    } catch (e) {
+        return null
+    }
+}
+
+// One biome condition, as config strings write them: 'ns:id', '#ns:tag', '!' in front to
+// negate (the animal homes' format, samsara_animal_homes.js). Returns a test on a
+// Holder<Biome>: getRegisteredName() for an id, is(TagKey) for a tag.
+function biomeCondition(spec) {
+    var s = '' + spec
+    var neg = s.charAt(0) === '!'
+    if (neg) s = s.substring(1)
+    var tag = null
+    if (s.charAt(0) === '#') {
+        tag = TagKeyClass.create(RegistriesClass.BIOME, AnchorResourceLocation.parse(s.substring(1)))
+    }
+    var id = s
+    return holder => {
+        var hit = tag !== null ? holder.is(tag) === true : ('' + holder.getRegisteredName()) === id
+        return neg ? !hit : hit
+    }
+}
+
+// A test over GROUPS: any group may match, every condition in it must hold.
+function biomeGroupsTest(groups) {
+    var built = []
+    for (var i = 0; i < groups.length; i++) {
+        var conds = []
+        for (var j = 0; j < groups[i].length; j++) conds.push(biomeCondition(groups[i][j]))
+        built.push(conds)
+    }
+    return holder => {
+        for (var g = 0; g < built.length; g++) {
+            var all = true
+            for (var c = 0; c < built[g].length; c++) {
+                if (!built[g][c](holder)) {
+                    all = false
+                    break
+                }
+            }
+            if (all) return true
+        }
+        return false
+    }
+}
+
+// Where an animal body's creature lives (config.animalBirth.homes, generated from Alex's
+// Mobs' spawn config), as a biome test; null for a body with no home listed.
+global.SMS.homeBiomeTest = form => {
+    var homes = (global.SMS.config.animalBirth || {}).homes || {}
+    var groups = homes['' + form]
+    if (!groups || groups.length === 0) return null
+    return biomeGroupsTest(groups)
+}
+
+// The nearest biome passing `test` to `from`, by vanilla's /locate biome search
+// (ServerLevel.findClosestBiome3d: the biome source sampled outward in a spiral, so the
+// first hit is the nearest -- for a large biome, its edge). {x, z, biome} or null.
+//
+// Cached by `key` -- which names the dimension -- and origin: biomes are fixed by the
+// seed, so only the first birth of a kind pays. Cleared when a world loads (ServerEvents.loaded, below): a new world in the
+// same session has a new seed.
+global.SMS.biomeAnchorCache = global.SMS.biomeAnchorCache || {}
+function nearestBiome(level, test, key, from) {
+    var ck = '' + key + '@' + from.x + ',' + from.z
+    var cache = global.SMS.biomeAnchorCache
+    if (cache[ck] !== undefined) return cache[ck]
+    var bs = global.SMS.config.biomeSearch
+    var found = null
+    try {
+        var pair = level.findClosestBiome3d(holder => test(holder), new BlockPosClass(from.x, from.y, from.z),
+            bs.radius, bs.horizontalStep, bs.verticalStep)
+        if (pair) {
+            var bp = pair.getFirst()
+            found = {
+                x: Math.floor(Number(bp.getX())),
+                z: Math.floor(Number(bp.getZ())),
+                biome: '' + pair.getSecond().getRegisteredName(),
+            }
+        }
+    } catch (e) {
+        console.warn(`[Samsara] biome search '${key}' failed: ${e}`)
+    }
+    cache[ck] = found
+    return found
+}
+
+ServerEvents.loaded(event => {
+    global.SMS.biomeAnchorCache = {}
+})
+
+// Where a birth into `realm` is anchored (config.birthPlace; decided 2026-10-25, the
+// user): {x, y, z, how}. `level` is the realm's dimension; `form` is an animal birth's
+// body. Rebirth means losing your place in the world, so it is never where the player
+// died. The cases, first match:
+//   a preta's grave (graveAnchor) -- the last HUMAN death, a different life's place;
+//   'worldSpawn'  the world's own spawn;
+//   'homeBiome'   the nearest of the body's home biomes to the world's spawn;
+//   'biome'       the nearest of birthPlace.biomes to realmSpawns[realm];
+//   otherwise, or when a search finds nothing, the world's spawn for a 'worldSpawn' /
+//   'homeBiome' realm and realmSpawns[realm] for the rest.
+// A birth found by biome starts at that column's surface (heightmap).
+global.SMS.birthAnchor = (player, realm, level, form) => {
     const cfg = global.SMS.config
     try {
         var grave = global.SMS.graveAnchor(player, realm)
-        if (grave) return grave
+        if (grave) return { x: grave.x, y: grave.y, z: grave.z, how: 'at-grave' }
     } catch (e) {
-        console.warn(`[Samsara] grave anchor unreadable for ${player.profile.name}; using the realm spawn: ${e}`)
+        console.warn(`[Samsara] grave anchor unreadable for ${player.profile.name}; using the realm's anchor: ${e}`)
     }
-    try {
-        var c = cfg.realmSpawns ? cfg.realmSpawns[realm] : null
-        if (c) return { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) }
-    } catch (ignored) {
-        // fall through
+    var place = (cfg.birthPlace || {})['' + realm] || {}
+    var c = (cfg.realmSpawns || {})['' + realm] || { x: 0, y: 64, z: 0 }
+    var dimId = '' + global.SMS.dimensionForRealm(realm)
+    var a = null
+    if (place.anchor === 'worldSpawn' || place.anchor === 'homeBiome') {
+        var ws = global.SMS.worldSpawn(player.server)
+        if (place.anchor === 'homeBiome' && ws) {
+            var test = global.SMS.homeBiomeTest(form)
+            var hit = test ? nearestBiome(level, test, dimId + '|home:' + form, ws) : null
+            if (hit) a = { x: hit.x, y: ws.y, z: hit.z, how: 'home-biome ' + hit.biome }
+        }
+        if (!a && ws) a = { x: ws.x, y: ws.y, z: ws.z, how: 'world-spawn' }
+    } else if (place.anchor === 'biome' && place.biomes && place.biomes.length > 0) {
+        var groups = []
+        for (var i = 0; i < place.biomes.length; i++) groups.push([place.biomes[i]])
+        var hit2 = nearestBiome(level, biomeGroupsTest(groups), dimId + '|biomes:' + place.biomes.join(','), c)
+        if (hit2) a = { x: hit2.x, y: c.y, z: hit2.z, how: 'biome ' + hit2.biome }
     }
-    console.warn(`[Samsara] no realmSpawns entry for '${realm}'; using origin`)
-    return { x: 0, y: 64, z: 0 }
+    if (!a) return { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z), how: 'realm-spawn' }
+    if (a.how !== 'world-spawn') {
+        var sy = surfaceY(level, a.x, a.z)
+        if (sy !== null) a.y = sy
+    }
+    return a
+}
+
+// ---- A human's home: the bed or respawn anchor it set (birthPlace.human.home) ----
+//
+// Decided 2026-10-25 (the user): "unless a player has set a spawn point as a human via a
+// bed or respawn anchor, in which case they should respawn wherever they set it, but only
+// as a human" -- and it is KEPT through other lives (asked and answered).
+//
+// Recorded from NeoForge's PlayerSetSpawnEvent, which ServerPlayer.setRespawnPosition
+// posts every time (read from neoforge-21.1.264): a bed or an anchor sets it with
+// forced = false; KubeJS's setSpawnLocation -- Samsara's own aim at each birth -- and
+// /spawnpoint set it with forced = true, so those are not homes. A null position is a
+// spawn being cleared. Only a living human's counts ("as a human").
+global.SMS.onSpawnSet = event => {
+    if (event.isForced()) return false
+    var pos = event.getNewSpawn()
+    if (pos === null || pos === undefined) return false
+    var player = event.getEntity()
+    if (!player || !player.isPlayer()) return false
+    if ('' + global.SMS.birthRealmOf(player) !== 'human') return false
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    tag.putDouble(nbt.homeX, Math.floor(Number(pos.getX())))
+    tag.putDouble(nbt.homeY, Math.floor(Number(pos.getY())))
+    tag.putDouble(nbt.homeZ, Math.floor(Number(pos.getZ())))
+    tag.putString(nbt.homeDim, '' + event.getSpawnLevel().location())
+    tag.putBoolean(nbt.homeSet, true)
+    return true
+}
+
+// The registration is in a try: a top-level throw here would abort the rest of this file.
+try {
+    NativeEvents.onEvent(Java.loadClass('net.neoforged.neoforge.event.entity.player.PlayerSetSpawnEvent'), event => {
+        try {
+            global.SMS.onSpawnSet(event)
+        } catch (e) {
+            console.warn(`[Samsara] could not record a set spawn point: ${e}`)
+        }
+    })
+} catch (e) {
+    console.error(`[Samsara] could not register the home hook -- humans will not return to their beds: ${e}`)
+}
+
+// The recorded home, {x, y, z, dim}, or null.
+global.SMS.homeOf = player => {
+    const nbt = global.SMS.config.nbt
+    const tag = global.SMS.persistedTag(player)
+    if (!tag.getBoolean(nbt.homeSet)) return null
+    var dim = global.SMS.nbtString(tag, nbt.homeDim)
+    var x = Number(tag.getDouble(nbt.homeX))
+    var y = Number(tag.getDouble(nbt.homeY))
+    var z = Number(tag.getDouble(nbt.homeZ))
+    if (dim === '' || !isFinite(x) || !isFinite(y) || !isFinite(z)) return null
+    return { x: x, y: y, z: z, dim: dim }
+}
+
+global.SMS.forgetHome = player => {
+    global.SMS.persistedTag(player).putBoolean(global.SMS.config.nbt.homeSet, false)
+}
+
+// Point the vanilla respawn at the home, NOT forced -- so vanilla decides, as for any
+// bed: a missing or obstructed bed, or an empty anchor, fails ("You have no home bed or
+// charged respawn anchor"), and a working anchor spends a charge
+// (ServerPlayer.findRespawnAndUseSpawnBlock, read from the jar). setRespawnPosition takes
+// a ResourceKey; LevelBlock.getDimensionKey() gives it -- the level's own dimension() is
+// shadowed by KubeJS's getDimension() bean (the N13 trap).
+function aimAtHome(player, home) {
+    var lvl = player.server.getLevel(home.dim)
+    if (!lvl) return false
+    var b = lvl.getBlock(home.x, home.y, home.z)
+    player.setRespawnPosition(b.getDimensionKey(), b.getPos(), 0, false, false)
+    return true
+}
+
+// After a respawn aimed at the home: did vanilla put the player there? A bed's or an
+// anchor's stand-up spot is beside it.
+function standsAtHome(player, home) {
+    if (('' + player.getLevel().getDimension()) !== home.dim) return false
+    return Math.abs(Number(player.getX()) - (home.x + 0.5)) <= 3 &&
+        Math.abs(Number(player.getY()) - home.y) <= 3 &&
+        Math.abs(Number(player.getZ()) - (home.z + 0.5)) <= 3
 }
 
 // ---- Destination -----------------------------------------------------------
@@ -684,7 +957,7 @@ global.SMS.pickDestination = player => {
     // routeFor() handles liberation and returns { realm, rule, liberated }.
     // A liberated player has no rebirth destination at all -- the caller must not
     // teleport them. A forced realm (testing) overrides everything.
-    const forced = global.SMS.forcedRealmOf(player)
+    var forced = global.SMS.forcedRealmOf(player)
     var realm, rule
     if (forced) {
         realm = forced
@@ -711,13 +984,21 @@ global.SMS.pickDestination = player => {
         return null
     }
 
-    const anchor = global.SMS.rebirthAnchor(player, realm)
+    // An animal birth's BODY is chosen first: where it is born follows the body (its
+    // creature's home biome). Chosen from the stats that routed it, before ripening.
+    const form = animalFormAtDeath(player, realm, global.SMS.tickClock || 0)
+    const anchor = global.SMS.birthAnchor(player, realm, level, form)
     // Born at the grave (a preta at its last human death)? Named in the rebirth line.
-    var atGrave = false
-    try {
-        atGrave = !!global.SMS.graveAnchor(player, realm)
-    } catch (ignored) {
-        atGrave = false
+    var atGrave = anchor.how === 'at-grave'
+    // A human with a home (the bed or anchor it set as a human) is reborn there if vanilla
+    // still finds it; the spot below is the fallback.
+    var home = null
+    if ('' + realm === 'human' && ((cfg.birthPlace || {}).human || {}).home) {
+        try {
+            home = global.SMS.homeOf(player)
+        } catch (ignored) {
+            home = null
+        }
     }
 
     // Vanilla Nether is 1:8; Samsara's own dimensions are all 1:1.
@@ -736,6 +1017,25 @@ global.SMS.pickDestination = player => {
     const cavern = cfg.cavernRealms.indexOf(realm) !== -1
     const skyMode = cavern ? 'ignore' : 'require'
 
+    // Everything a destination carries, whichever way its spot was found.
+    function destination(spot, extra) {
+        var d = {
+            realm: realm,
+            dimId: dimId,
+            level: level,
+            spot: spot,
+            stats: stats,
+            rule: rule,
+            atGrave: atGrave,
+            form: form,
+            home: home,
+            anchorHow: anchor.how,
+        }
+        var ks = Object.keys(extra)
+        for (var i = 0; i < ks.length; i++) d[ks[i]] = extra[ks[i]]
+        return d
+    }
+
     // --- Cache hit? Re-validate before trusting it.
     var cacheKey = spawnCacheKey(realm, dimId, searchAnchor)
     var cached = global.SMS.spawnCache[cacheKey]
@@ -747,23 +1047,17 @@ global.SMS.pickDestination = player => {
         var fresh = (global.SMS.tickClock || 0) - cached.at
         if (fresh >= 0 && fresh < cfg.safeSpawn.cacheTicks) {
             if (isValidStand(level, cached.x, cached.y, cached.z, skyMode)) {
-                return {
-                    realm: realm,
-                    dimId: dimId,
-                    level: level,
-                    spot: { x: cached.x, y: cached.y, z: cached.z },
-                    stats: stats,
-                    rule: rule,
-                    cached: true,
-                    atGrave: atGrave,
-                }
+                return destination({ x: cached.x, y: cached.y, z: cached.z }, { cached: true })
             }
         }
         // stale or no longer valid
         delete global.SMS.spawnCache[cacheKey]
     }
 
-    const found = findRebirthSpot(level, realm, searchAnchor, dimId)
+    var found = findRebirthSpot(level, realm, searchAnchor, dimId)
+    // Nothing near the anchor -- and nothing UNDER it either? Then the land is elsewhere:
+    // ask the generator where (brahma's seeded islands).
+    if (!found) found = probeForLand(level, realm, searchAnchor, dimId)
 
     if (!found) {
         // Nothing survivable anywhere in the searched volume.
@@ -776,49 +1070,15 @@ global.SMS.pickDestination = player => {
         // discarded, and `birthRealm` was then written as 'human' so they got no
         // penalties either.
         //
-        // Instead: stay in the realm, place the player at the anchor, and CARVE a
-        // pocket of air so they are not suffocating inside rock.
-        //
-        // Carving is not the old self-perpetuating platform problem. That bug was a
-        // 3x3 stone platform the NEXT search would find and reuse forever, making the
-        // first failure permanent. This writes air, not ground, at a known-bad
-        // location we are already committed to -- and because the spot is never
-        // cached, a later rebirth re-searches from scratch.
+        // Instead: stay in the realm, at the anchor, on real footing (lastResortSpot).
+        // Never cached, so a later rebirth re-searches from scratch.
+        var fb = cfg.realmScanBounds[realm] || cfg.realmScanBounds.default
+        var last = lastResortSpot(level, bx, anchor.y, bz, fb)
         console.warn(
             `[Samsara] no survivable spot in ${dimId} near ${bx},${anchor.y},${bz}` +
-                ` (realm ${realm}); staying in ${realm} and carving a pocket at the anchor`
+                ` (realm ${realm}); staying in ${realm}: ${last.how} at ${last.x},${last.y},${last.z}`
         )
-
-        var fb = cfg.realmScanBounds[realm] || cfg.realmScanBounds.default
-        var py = anchor.y
-        if (py < fb.min + 1) py = fb.min + 1
-        if (py > fb.max - 3) py = fb.max - 3
-
-        try {
-            // Floor under the feet only if there is nothing solid there, so we do not
-            // replace real terrain.
-            var floorBlock = level.getBlock(bx, py - 1, bz)
-            if (!isGround(floorBlock)) {
-                setBlockId(floorBlock, cfg.safeSpawn.fallbackFloorBlock)
-            }
-            // Clear the body space and a little headroom.
-            for (var cy = 0; cy <= 2; cy++) {
-                setBlockId(level.getBlock(bx, py + cy, bz), 'minecraft:air')
-            }
-        } catch (e) {
-            console.warn(`[Samsara] could not carve a fallback pocket: ${e}`)
-        }
-
-        return {
-            realm: realm,
-            dimId: dimId,
-            level: level,
-            spot: { x: bx, y: py, z: bz },
-            stats: stats,
-            rule: rule,
-            degraded: true,
-            atGrave: atGrave,
-        }
+        return destination({ x: last.x, y: last.y, z: last.z }, { degraded: true, lastResort: last.how })
     }
 
     // Cache the verified spot so the next death in this realm is nearly free.
@@ -830,16 +1090,112 @@ global.SMS.pickDestination = player => {
         at: global.SMS.tickClock || 0,
     }
 
-    return {
-        realm: realm,
-        dimId: dimId,
-        level: level,
-        spot: found.spot,
-        stats: stats,
-        rule: rule,
-        pass: found.pass,
-        atGrave: atGrave,
+    return destination(found.spot, { pass: found.pass })
+}
+
+// ---- When the anchor has no land near it ---------------------------------------
+
+// Is the column at x,z void all the way down (brahma between its islands)? Read from the
+// terrain generator -- ChunkGenerator.getBaseHeight walks the noise column, generating no
+// chunk -- and treated as "has terrain" whenever that cannot be read, so a realm whose
+// generator is unreadable keeps the old behaviour rather than probing blind.
+function terrainProbeTools(level) {
+    if (!HeightmapTypes) return null
+    try {
+        var cs = level.getChunkSource()
+        return { gen: cs.getGenerator(), rs: cs.randomState() }
+    } catch (e) {
+        return null
     }
+}
+function baseHeight(level, tools, x, z) {
+    try {
+        var h = Number(tools.gen.getBaseHeight(x, z, HeightmapTypes.WORLD_SURFACE_WG, level, tools.rs))
+        return isFinite(h) ? h : null
+    } catch (e) {
+        return null
+    }
+}
+
+// No standable spot near the anchor, and NO TERRAIN under it: ask the generator where
+// land is, in rings `terrainProbe.step` apart out to `radius`, and search at the first
+// `tries` columns that hold some. Returns findRebirthSpot's result with its pass named
+// 'probe@dx,dz/<pass>', or null. Not run while the anchor has terrain under it -- a
+// roofed or flooded spot is the ordinary passes' business, and four more full searches
+// there would be pure cost.
+function probeForLand(level, realm, anchor, dimId) {
+    const cfg = global.SMS.config
+    const pr = cfg.safeSpawn.terrainProbe
+    if (!pr) return null
+    const tools = terrainProbeTools(level)
+    if (!tools) return null
+    const bounds = cfg.realmScanBounds[realm] || cfg.realmScanBounds.default
+    var here = baseHeight(level, tools, anchor.x, anchor.z)
+    if (here === null || here > bounds.min + 1) return null
+    var rings = Math.floor(pr.radius / pr.step)
+    var tries = 0
+    for (var ring = 1; ring <= rings; ring++) {
+        for (var dx = -ring; dx <= ring; dx++) {
+            for (var dz = -ring; dz <= ring; dz++) {
+                if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue
+                var x = anchor.x + dx * pr.step
+                var z = anchor.z + dz * pr.step
+                var h = baseHeight(level, tools, x, z)
+                if (h === null) return null
+                if (h <= bounds.min + 1) continue
+                loadChunkAt(level, x, z)
+                var r = findRebirthSpot(level, realm, { x: x, y: Math.floor(h), z: z }, dimId)
+                if (r) return { spot: r.spot, pass: 'probe@' + dx * pr.step + ',' + dz * pr.step + '/' + r.pass }
+                tries++
+                if (tries >= pr.tries) return null
+            }
+        }
+    }
+    return null
+}
+
+// The very last resort, at the anchor column -- and NEVER a block in mid-air (the user,
+// 2026-10-25). Walks down from the anchor to the first block that is not air:
+//   found  -> footing: the player stands on it (made stone if it was lava or water) with
+//             three blocks carved clear above -- a pocket in the ground, nothing to fall
+//             through;
+//   none   -> the column is void to the bottom of the realm. Only a realm with no terrain
+//             within the probe's reach comes here -- a broken datapack -- and it gets an
+//             ISLAND (islandRadius out, islandDepth thick), not the single stone block that
+//             stood at brahma's 0,150,0 on 2026-10-25.
+// Returns {x, y, z, how}.
+function lastResortSpot(level, bx, by, bz, bounds) {
+    const sp = global.SMS.config.safeSpawn
+    var py = by
+    if (py < bounds.min + 1) py = bounds.min + 1
+    if (py > bounds.max - 3) py = bounds.max - 3
+    var fy = null
+    for (var y = py - 1; y >= bounds.min; y--) {
+        if (!isClear(level.getBlock(bx, y, bz))) {
+            fy = y
+            break
+        }
+    }
+    try {
+        if (fy !== null) {
+            var floorBlock = level.getBlock(bx, fy, bz)
+            if (!isGround(floorBlock)) setBlockId(floorBlock, sp.fallbackFloorBlock)
+            for (var cy = 1; cy <= 3; cy++) setBlockId(level.getBlock(bx, fy + cy, bz), 'minecraft:air')
+            return { x: bx, y: fy + 1, z: bz, how: 'carved' }
+        }
+        console.error(`[Samsara] NO TERRAIN under or near ${bx},${bz} -- the realm's datapack is broken; building an island`)
+        var r = sp.islandRadius || 2
+        var depth = sp.islandDepth || 3
+        for (var ix = -r; ix <= r; ix++) {
+            for (var iz = -r; iz <= r; iz++) {
+                for (var iy = 1; iy <= depth; iy++) setBlockId(level.getBlock(bx + ix, py - iy, bz + iz), sp.fallbackFloorBlock)
+                for (var ay = 0; ay <= 2; ay++) setBlockId(level.getBlock(bx + ix, py + ay, bz + iz), 'minecraft:air')
+            }
+        }
+    } catch (e) {
+        console.warn(`[Samsara] could not prepare the last-resort spot: ${e}`)
+    }
+    return { x: bx, y: fy !== null ? fy + 1 : py, z: bz, how: fy !== null ? 'carved' : 'island' }
 }
 
 // ---- Test seam -------------------------------------------------------------
@@ -858,6 +1214,9 @@ global.SMS.debugSpawn = {
     seesSky: seesSky,
     isClear: isClear,
     isGround: isGround,
+    overVoid: overVoid,
+    probeForLand: probeForLand,
+    lastResortSpot: lastResortSpot,
 }
 
 // ---- Liberation ------------------------------------------------------------
@@ -877,8 +1236,9 @@ global.SMS.debugSpawn = {
 //
 // What is NOT implemented and must not be improvised:
 //   - Mara's assault, the Bodhi seat, parinibbana and credits (design doc 10/14);
-//   - turning off luck, aging, craving and realm penalties (those systems do not
-//     exist yet);
+//   - turning off luck and craving (those systems do not exist yet). Realm penalties
+//     and Aging DO turn off: applyRealmEffects below lifts them, and a liberated
+//     player no longer ages (samsara_realms.js);
 //   - anything that touches the save. The project notes: NEVER delete or corrupt save
 //     files. That rule is absolute and liberation does not get an exception.
 global.SMS.grantLiberation = (player, reason) => {
@@ -922,6 +1282,10 @@ global.SMS.grantLiberation = (player, reason) => {
 // pos, angle, forced = true, ...), verified in the KubeJS 6 and 7 jars.
 //
 // Editing SpawnX/SpawnY/SpawnZ NBT does NOT work -- that is only the serialized form.
+//
+// The one exception is a human with a home (2026-10-25): the respawn is aimed at the
+// home, NOT forced, so vanilla itself checks the bed or anchor (aimAtHome above).
+//
 // The body an animal birth gets: '' for any other realm, and '' when nothing is
 // configured (applyRealmEffects then leaves the player in their own body).
 function animalFormAtDeath(player, realm, nowT) {
@@ -930,14 +1294,29 @@ function animalFormAtDeath(player, realm, nowT) {
     return pick ? pick.form : ''
 }
 
+// HOW a destination's spot was chosen, for the rebirth log line: the pass (or the cache,
+// or the last resort) and where the search was anchored.
+function describeHow(dest) {
+    var how = dest.degraded
+        ? 'DEGRADED (no spot found; ' + (dest.lastResort || '?') + ' at anchor)'
+        : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?'))
+    if (dest.anchorHow) how += ' from ' + dest.anchorHow
+    if (dest.home) how += ' home?'
+    return how
+}
+
 EntityEvents.death(event => {
     const player = event.entity
     if (!player || !player.isPlayer()) return
 
     // A liberated player is outside the cycle: death is an ordinary Minecraft death
-    // and vanilla handles the respawn (their bed, or world spawn). Nothing here runs.
+    // and vanilla handles the respawn (their bed, or world spawn). Nothing here runs --
+    // but a home the player set as a human is handed back to vanilla first: Samsara's
+    // births since then aimed the vanilla respawn elsewhere.
     try {
         if (global.SMS.isLiberated(player)) {
+            var libHome = global.SMS.homeOf(player)
+            if (libHome) aimAtHome(player, libHome)
             console.info(`[Samsara] ${player.profile.name} is liberated; ordinary respawn, no rebirth`)
             return
         }
@@ -1000,24 +1379,32 @@ EntityEvents.death(event => {
                 y: dest.spot.y,
                 z: dest.spot.z,
                 at: nowT,
-                // An animal birth's BODY, chosen now, from the stats that routed it --
-                // ripening below changes them (it halves delusion), and the diet must
-                // follow the karma that caused the birth, as the realm does.
-                form: animalFormAtDeath(player, dest.realm, nowT),
+                // An animal birth's BODY, chosen by pickDestination from the stats that
+                // routed it -- ripening below changes them (it halves delusion), and the
+                // diet must follow the karma that caused the birth, as the realm does.
+                form: dest.form || '',
+                // A human's home (the bed or anchor it set as a human), or null. The
+                // respawn handler checks whether vanilla found it.
+                home: dest.home || null,
                 // Carried so the respawn log can name HOW the spot was chosen. The
                 // respawn handler has no access to the destination object on this
                 // path, and a bad placement is undiagnosable without it.
-                how: (dest.degraded
-                    ? 'DEGRADED (no spot found; carved at anchor)'
-                    : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?'))) +
-                    (dest.atGrave ? ' at-grave' : ''),
+                how: describeHow(dest),
             }
-            player.setSpawnLocation(dest.level.getBlock(dest.spot.x, dest.spot.y, dest.spot.z))
+            var aimedHome = false
+            if (dest.home) {
+                try {
+                    aimedHome = aimAtHome(player, dest.home)
+                } catch (eh) {
+                    console.warn(`[Samsara] could not aim ${player.profile.name}'s respawn at their home: ${eh}`)
+                }
+            }
+            if (!aimedHome) player.setSpawnLocation(dest.level.getBlock(dest.spot.x, dest.spot.y, dest.spot.z))
 
             if (dest.degraded) {
                 console.warn(
                     `[Samsara] ${player.profile.name}: no searchable spot in ${dest.realm};` +
-                        ` placed at the carved anchor ${dest.spot.x},${dest.spot.y},${dest.spot.z}.` +
+                        ` placed by the last resort (${dest.lastResort}) at ${dest.spot.x},${dest.spot.y},${dest.spot.z}.` +
                         ` The realm is UNCHANGED -- check that realm's realmSpawns entry.`
                 )
             }
@@ -1030,8 +1417,13 @@ EntityEvents.death(event => {
             // this throws the rebirth still lands correctly -- the player just keeps
             // karma they should have spent, which is recoverable. The reverse (losing
             // the destination) would dump them in the wrong realm.
+            //
+            // A death by OLD AGE (Aging ran out; samsara_realms.js marks it for the length
+            // of the blow, which is when this runs) ripens at full rate and is recorded as
+            // no rapid-death streak (ripenKarma, opts.oldAge).
             try {
-                global.SMS.ripenKarma(player, dest.realm)
+                var oldAge = !!(global.SMS.diesOfOldAge && global.SMS.diesOfOldAge(player))
+                global.SMS.ripenKarma(player, dest.realm, { oldAge: oldAge })
             } catch (e2) {
                 console.warn(`[Samsara] ripening failed for ${player.profile.name}: ${e2}`)
             }
@@ -1092,7 +1484,7 @@ PlayerEvents.respawned(event => {
         pending = null
     }
 
-    var realm, dimId, spot, stats, how, form
+    var realm, dimId, spot, stats, how, form, home
     if (pending) {
         realm = pending.realm
         dimId = pending.dimId
@@ -1100,6 +1492,7 @@ PlayerEvents.respawned(event => {
         stats = global.SMS.getStats(player)
         how = pending.how || '?'
         form = pending.form || ''
+        home = pending.home || null
     } else {
         // No stashed destination (server restarted between death and respawn, or the
         // death hook failed). Resolve now.
@@ -1121,14 +1514,55 @@ PlayerEvents.respawned(event => {
         dimId = dest.dimId
         spot = dest.spot
         stats = dest.stats
-        how = (dest.degraded
-            ? 'DEGRADED (no spot found; carved at anchor)'
-            : (dest.cached ? 'cached' : 'pass=' + (dest.pass || '?')) + ' (late-resolve)') +
-            (dest.atGrave ? ' at-grave' : '')
+        how = describeHow(dest) + ' (late-resolve)'
         // Nothing ripened on this path, so the stats are still the ones that routed it.
-        form = animalFormAtDeath(player, realm, global.SMS.tickClock || 0)
+        form = dest.form || ''
+        home = dest.home || null
     }
 
+    // A human aimed at its home: if vanilla found the bed or anchor, the player already
+    // stands beside it -- born there, no teleport. If not (broken, obstructed, an empty
+    // anchor), vanilla has said so ("You have no home bed...") and put the player at the
+    // world spawn; the home is forgotten and the birth goes to the searched spot.
+    if (home) {
+        var atHome = false
+        try {
+            atHome = standsAtHome(player, home)
+        } catch (e) {
+            atHome = false
+        }
+        if (atHome) {
+            global.SMS.placeBirth(player, {
+                realm: realm,
+                dimId: home.dim,
+                spot: { x: Math.floor(Number(player.getX())), y: Math.floor(Number(player.getY())), z: Math.floor(Number(player.getZ())) },
+                stats: stats,
+                how: 'home ' + home.x + ',' + home.y + ',' + home.z,
+                form: form,
+                stay: true,
+            }, 'rebirth')
+            return
+        }
+        global.SMS.forgetHome(player)
+        how += ' (home gone)'
+    }
+
+    global.SMS.placeBirth(player, { realm: realm, dimId: dimId, spot: spot, stats: stats, how: how, form: form }, 'rebirth')
+})
+
+// ---- A birth: put the player in the new life ---------------------------------
+//
+// Teleport to the spot, record the birth realm and the body, apply the realm's rules,
+// say what they are, and log it. `label` names it in the log ('rebirth'). (Shared with
+// the deva's fall, a birth without a death, from 2026-10-24 until Aging retired the fall
+// on 2026-10-25.)
+global.SMS.placeBirth = (player, birth, label) => {
+    const cfg = global.SMS.config
+    const realm = birth.realm
+    const dimId = birth.dimId
+    const spot = birth.spot
+    const stats = birth.stats
+    const form = birth.form || ''
     // Only one teleportTo overload exists:
     //   kjs$teleportTo(ResourceLocation dim, double x, double y, double z, float yaw, float pitch)
     // All six args are required.
@@ -1153,8 +1587,9 @@ PlayerEvents.respawned(event => {
         pitch = 0
     }
 
-    // +0.5 centres the player on the block. y is the feet position already.
-    player.teleportTo(dimId, spot.x + 0.5, spot.y, spot.z + 0.5, yaw, pitch)
+    // +0.5 centres the player on the block. y is the feet position already. A birth at
+    // the player's home (`stay`) is where vanilla already put them.
+    if (!birth.stay) player.teleportTo(dimId, spot.x + 0.5, spot.y, spot.z + 0.5, yaw, pitch)
 
     // Record the realm this life began in. Realm PENALTIES follow birthRealm, never the
     // dimension the player happens to stand in. The body is recorded with it ('' for
@@ -1189,13 +1624,20 @@ PlayerEvents.respawned(event => {
     // all -- the y=-3 human rebirth needed a source read to attribute, when
     // `pass=no-sky-fallback` in this line would have named the cause outright.
     console.info(
-        `[Samsara] rebirth: ${player.profile.name} -> ${realm} (${dimId})` +
-            ` @ ${spot.x},${spot.y},${spot.z} [${how}]` +
+        `[Samsara] ${label}: ${player.profile.name} -> ${realm} (${dimId})` +
+            ` @ ${spot.x},${spot.y},${spot.z} [${birth.how}]` +
             (form ? ` [body ${form}]` : '') +
             ` [poisons g=${stats.greed} h=${stats.hatred} d=${stats.delusion}` +
             ` antidotes gen=${stats.generosity} met=${stats.metta} wis=${stats.wisdom}]`
     )
-})
+}
+
+// ---- The deva's fall: RETIRED 2026-10-25 ----------------------------------------------
+//
+// From 2026-10-24 a deva whose radiance faded FELL: a rebirth by karma without a death,
+// routed with rule 3 skipped. Aging replaced it (the user, 2026-10-25): every life ends in
+// death by old age, and a deva's is routed normally -- "No, route normally" -- so it may be
+// a deva again at once if its merit allows. git history has global.SMS.fallFromHeaven.
 
 // ---- Debug command ---------------------------------------------------------
 //
@@ -1236,7 +1678,10 @@ ServerEvents.commandRegistry(event => {
                         return 1
                     }
 
-                    const anchor = global.SMS.rebirthAnchor(player, realm)
+                    // Anchored as a birth would be (an animal: a body picked from the
+                    // player's stats now, and its home biome).
+                    const form = animalFormAtDeath(player, realm, global.SMS.tickClock || 0)
+                    const anchor = global.SMS.birthAnchor(player, realm, level, form)
                     var bx = anchor.x
                     var bz = anchor.z
                     if (dimId === 'minecraft:the_nether') {
@@ -1247,7 +1692,12 @@ ServerEvents.commandRegistry(event => {
                     delete global.SMS.spawnCache[spawnCacheKey(realm, dimId, { x: bx, z: bz })]
                     loadChunkAt(level, bx, bz)
 
-                    const found = findRebirthSpot(level, realm, { x: bx, y: anchor.y, z: bz }, dimId)
+                    var found = findRebirthSpot(level, realm, { x: bx, y: anchor.y, z: bz }, dimId)
+                    if (!found) found = probeForLand(level, realm, { x: bx, y: anchor.y, z: bz }, dimId)
+                    ctx.source.sendSuccess(
+                        Text.gray(`  anchor: ${bx},${anchor.y},${bz} (${anchor.how})` + (form ? ` body ${form}` : '')),
+                        false
+                    )
                     if (!found) {
                         ctx.source.sendFailure(Text.red(`${realm} (${dimId}): NO SAFE SPOT FOUND near ${bx},${bz}`))
                         return 1

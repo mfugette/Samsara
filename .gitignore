@@ -57,6 +57,11 @@
 # SparseStructures: Tombstone's abandoned graves set to factor 0 (off).
 !/config/sparsestructures.json5
 
+# Streams Reflowing (2026-10-25): outletBiomes names the deva realm's ocean and river as
+# stream mouths -- the deva biomes are Samsara's own, in none of the vanilla water tags
+# its default list reads, and a stream with no mouth has nowhere to end.
+!/config/streamsreflowing.properties
+
 # 3. Re-ignore things that live INSIDE the whitelisted trees.
 
 # KubeJS writes its Mojang-mapping remapper cache and generated output here.

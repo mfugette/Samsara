@@ -14,8 +14,10 @@
 // takes nothing. Only a player *born* into a realm lives under its rules.
 // See design doc section 7.
 //
-// Effects are declared in config.realmEffects. Realms with no entry have no penalties
-// yet (asura, deva, brahma: a design question, not built).
+// Effects are declared in config.realmEffects. Realms with no entry have no rules yet
+// (asura, brahma: a design question, not built). The deva's are blessings, not
+// penalties (2026-10-24). Every realm, those two included, AGES (config.aging,
+// 2026-10-25): the life ends in death by old age.
 //
 // CANCELLING ON KUBEJS 7 (and 6 -- read from both jars): event.cancel() THROWS an
 // EventExit, so nothing after it in the handler runs, and a try/catch around it CATCHES
@@ -56,9 +58,14 @@ global.SMS.describeEffects = fx => {
     if (fx.maxHealth !== undefined) parts.push('max health ' + fx.maxHealth)
     if (fx.noDamage) parts.push('takes no damage')
     if (fx.ignoredByMobs) parts.push('ignored by mobs')
-    if (fx.life) parts.push('a ' + Math.round(fx.life.ticks / 1200) + '-minute life')
+    if (fx.heal) parts.push('mends')
+    if (fx.resistance) parts.push('takes ' + Math.round(fx.resistance * 100) + '% less damage')
+    if (fx.fireImmune) parts.push('fire cannot harm it')
+    if (fx.absorption) parts.push('golden hearts every ' + Math.round(fx.absorption.everyTicks / 1200) + ' min')
+    if (fx.torment) parts.push('withers, never below ' + fx.torment.floorHealth + ' health')
     if (fx.foodPerMeal !== undefined) parts.push(fx.foodPerMeal + ' food per meal')
-    if (fx.hungerEffect) parts.push('always hungry')
+    if (fx.exhaustion) parts.push('always hungry')
+    if (fx.fullMealHalvesAging) parts.push('a full belly halves its aging')
     if (fx.adventureMode) parts.push('adventure mode')
     if (fx.noContainers) parts.push('no containers')
     if (fx.noCrafting) parts.push('no crafting')
@@ -153,18 +160,70 @@ function animalFormOf(player) {
 
 // Put the player in `form` (a creature id) or, for '', back in their own body.
 // `owned` says whether a creature body is now worn -- and so owns max health.
+// `force` sends the switch even when the body already reads as worn: the re-send a
+// second after every birth (resyncBody below).
 //
 // `form` is normalised to a JS string FIRST. The first in-game test (2026-10-22) passed
 // undefined here (N12 made the creature index NaN): the switch went to `normal` while
 // `owned` read true, so the player stayed human AND max health was left to a body they
 // did not have. Every decision below reads the one normalised value.
-global.SMS.setBody = (player, form) => {
+global.SMS.setBody = (player, form, force) => {
     var want = form ? '' + form : ''
     if (!walkersLoaded()) return { owned: false, note: want ? 'own (no Woodwalkers)' : 'own' }
     var worn = wornForm(player)
-    if (worn !== null && worn === want) return { owned: want !== '', note: want ? want + ' (already worn)' : 'own' }
+    if (!force && worn !== null && worn === want) return { owned: want !== '', note: want ? want + ' (already worn)' : 'own' }
     global.SMS.serverCommand(player, 'walkers switchShape @s ' + (want || 'normal'))
-    return { owned: want !== '', note: want || 'own (switched back)' }
+    return { owned: want !== '', note: want || (force ? 'own (re-sent)' : 'own (switched back)') }
+}
+
+// ---- The body, sent again a second after every birth ---------------------------
+//
+// Found in game 2026-10-24: a snow-leopard-born player reborn human could build and break
+// (the server had switched them back -- the log said "body=own (switched back)") but was
+// still DRAWN as the leopard. On a respawn Woodwalkers' CLIENT copies the old player's
+// shape onto the new one (ClientRespawnHandler.respawn, walkers-5.8.13), and Samsara's
+// switch is sent inside the same respawn; whichever the client applies last wins. So
+// every applyRealmEffects (a birth, a login, /karma realm, liberation) queues the body to
+// be sent once more BODY_RESYNC_TICKS later, unconditionally -- the switch is idempotent
+// on the server -- and the realm tick sends it.
+//
+// Woodwalkers writes max health on a switch, and switching back to the player's own body
+// restores ITS cached value (J40) -- which would undo a naraka birth's 10. So a re-send
+// to the player's own body writes the realm's max health again after it, as
+// applyRealmEffects does (body first, then health).
+//
+// A re-sent bird body also gets its flight back (Woodwalkers grants flight on a switch to
+// a flying shape), so a flier born before the game-mode order was fixed can fly again.
+const BODY_RESYNC_TICKS = 20
+global.SMS.bodySync = global.SMS.bodySync || {}
+
+function queueBodySync(player) {
+    if (!walkersLoaded()) return
+    global.SMS.bodySync['' + player.uuid] = (global.SMS.tickClock || 0) + BODY_RESYNC_TICKS
+}
+
+// The max health a realm sets on the player's own body.
+function maxHealthTarget(fx) {
+    return fx.maxHealth === undefined ? VANILLA_MAX_HEALTH : fx.maxHealth
+}
+
+function resyncBody(player) {
+    var liberated = false
+    try {
+        liberated = global.SMS.isLiberated(player)
+    } catch (ignored) {
+        liberated = false
+    }
+    const realm = global.SMS.birthRealmOf(player)
+    const fx = liberated ? {} : global.SMS.effectsFor(realm)
+    const form = !liberated && realm === 'animal' ? animalFormOf(player) : ''
+    const worn = wornForm(player)
+    const body = global.SMS.setBody(player, form, true)
+    if (!body.owned) player.setMaxHealth(maxHealthTarget(fx))
+    console.info(
+        `[Samsara] body re-sync: ${player.profile.name} -> ${body.note}` +
+            ` (worn before: ${worn === null ? 'unreadable' : worn || 'own'})`
+    )
 }
 
 // Say whether bodies are safe: Woodwalkers must be at API_ONLY, or players can unlock
@@ -218,16 +277,22 @@ const VANILLA_MAX_HEALTH = 20.0
 // Returns null when unreadable, which callers must treat as "set it anyway" rather
 // than "skip": the whole point is that a missing getter must not disable the penalty.
 
-// How often the preta tick runs. 4 ticks = 5x/second: often enough that the bar
-// record the meal correction reads is never more than a fraction of a second old, and
-// the life clock counts down in 4-tick steps. Cheap: a few reads per online player.
-const PRETA_INTERVAL_TICKS = 4
+// How often the realm tick runs. 4 ticks = 5x/second: often enough that the bar
+// record the preta's meal correction reads is never more than a fraction of a second
+// old, and Aging counts down in 4-tick steps. Cheap: a few reads per online
+// player.
+const REALM_INTERVAL_TICKS = 4
+// A realm's effect (realmEffects.<realm>.effect) has no end, and is given again every this
+// many passes -- about once a second -- so milk cannot lift it for long.
+const EFFECT_EVERY_PASSES = 5
 
 // On global.SMS, not a file-local `let`, for the same reason global.SMS.tickClock is:
 // `global` survives /reload, so the tick's cadence is not reset every time the
 // scripts reload. It also lets the offline harness drive the throttle deterministically
-// instead of inheriting whatever phase an earlier test left it in.
-global.SMS.pretaCounter = global.SMS.pretaCounter || 0
+// instead of inheriting whatever phase an earlier test left it in. `realmPasses` counts
+// the passes themselves, for the effect's, the torment's and the healing's own cadences.
+global.SMS.realmCounter = global.SMS.realmCounter || 0
+global.SMS.realmPasses = global.SMS.realmPasses || 0
 
 // ---- Adventure mode (animal and preta births, decided 2026-10-22) -----------
 //
@@ -277,106 +342,253 @@ function applyGameMode(player, want) {
     return (mode || 'unreadable') + ' (left alone)'
 }
 
-// ---- The preta life (realmEffects.preta.life) --------------------------------
+// ---- Aging: every life's clock (config.aging, decided 2026-10-25) -----------------
 //
-// The CLOCK is stored (nbt.pretaLife, ticks left; 0 = none running) and counts down
-// only while the player is online, in the preta tick below. The effect -- Samsara's own
-// Hungry Ghost, whose timer is this clock -- is DRAWN from it: given for the time left,
-// re-given about once a second -- so milk, or anything else that clears it, cannot end
-// the life early -- and replaced when the clock is halved. `/effect give` cannot shorten
-// a running effect, hence the clear first.
-function giveLifeEffects(player, life, left, replace) {
+// The CLOCK is stored (nbt.agingLeft, ticks left; 0 = none running) and counts down only
+// while the player is online, in the realm tick below. Samsara's own Aging effect, whose
+// timer is this clock, is DRAWN from it: given for the time left, re-given about once a
+// second -- so milk, or anything else that clears it, cannot end the life early -- and
+// replaced when the clock changes under it (a birth, /karma life, a preta's halving).
+// `/effect give` cannot shorten a running effect, hence the clear first. When the clock
+// runs out the player dies of old age (dieOfOldAge below).
+
+// How long a life in `realm` lasts, in ticks. A realm missing from config.aging.ticks lives
+// as long as a human: without a span it would be immortal (harness 13 checks none is
+// missing).
+function agingSpan(realm) {
+    var spans = (global.SMS.config.aging || {}).ticks || {}
+    var n = Number(spans['' + realm])
+    if (!(n > 0)) n = Number(spans.human)
+    return n > 0 ? n : 432000
+}
+global.SMS.agingSpan = agingSpan
+
+function agingEffectId() {
+    return (global.SMS.config.aging || {}).effect || 'samsara:aging'
+}
+
+function giveAging(player, left, replace) {
     var seconds = Math.ceil(left / 20)
     if (!isFinite(seconds) || seconds < 1) seconds = 1
-    for (var i = 0; i < life.effects.length; i++) {
-        var e = life.effects[i]
-        if (replace) global.SMS.serverCommand(player, 'effect clear @s ' + e.id)
-        global.SMS.serverCommand(player, 'effect give @s ' + e.id + ' ' + seconds + ' ' + (e.amplifier || 0) + ' true')
-    }
+    var id = agingEffectId()
+    if (replace) global.SMS.serverCommand(player, 'effect clear @s ' + id)
+    global.SMS.serverCommand(player, 'effect give @s ' + id + ' ' + seconds + ' 0 true')
+}
+
+// A realm's own effect (realmEffects.<realm>.effect: the Torment, the Craving, the
+// Radiance), for the whole life: given with NO end (`infinite`, /effect since 1.19.4), so
+// Aging stays the only clock, and renewed about once a second by the realm tick, so milk
+// cannot lift it. Particles hidden.
+function giveRealmEffect(player, fx) {
+    if (fx.effect) global.SMS.serverCommand(player, 'effect give @s ' + fx.effect + ' infinite 0 true')
 }
 
 function minutesSeconds(ticks) {
     var s = Math.max(0, Math.ceil(ticks / 20))
+    var h = Math.floor(s / 3600)
+    var m = Math.floor((s % 3600) / 60)
     var r = s % 60
-    return Math.floor(s / 60) + ':' + (r < 10 ? '0' : '') + r
+    if (h > 0) return h + ':' + (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r
+    return m + ':' + (r < 10 ? '0' : '') + r
 }
 global.SMS.minutesSeconds = minutesSeconds
 
-// The craving is spent (decided 2026-10-22, the user): the end of a preta's time is NOT a
-// death. The player is human again where it stands -- by the grave it has been haunting,
-// unless it wandered -- and applyRealmEffects lifts every preta rule (the hunger, the
-// Hungry Ghost effect, Adventure mode, the clock) and hands back the grave keys Samsara was
-// keeping (samsara_tombstone.js): the key opens the grave, or takes the player to it.
-// No routing and no ripening: those belong to a death, and this is not one.
+// A span in words, for the birth message: '6 hours', '30 minutes'.
+function spanWords(ticks) {
+    var mins = Math.round(ticks / 1200)
+    if (mins >= 60 && mins % 60 === 0) return mins / 60 + (mins === 60 ? ' hour' : ' hours')
+    return mins + (mins === 1 ? ' minute' : ' minutes')
+}
+
+// The effect a realm's rules give, for the teardown. clearPreviousLife clears it only for
+// the realm whose effect Samsara gave last (nbt.effectsOf), so a human's own potions
+// survive a login.
+function realmEffectIds(fx) {
+    return fx.effect ? [fx.effect] : []
+}
+
+// ---- Death by old age ----------------------------------------------------------------
 //
-// It used to end with kill(). Besides not being what the user wanted, that was fragile:
-// Tombstone's Ghostly Shape sets ALL damage to 0, generic_kill included, so a preta
-// wearing it would have survived its own end -- clock at 0, still a preta, forever.
-function endPretaLife(player) {
-    const name = player.profile.name
-    var keysKept = 0
+// When Aging runs out the player DIES (the user, 2026-10-25: "real death by old age"):
+// items drop -- a human's to its grave -- the death is routed by karma, and the karma that
+// caused the birth ripens, as at any death. Two things differ, and both read
+// global.SMS.diesOfOldAge(player) while the death handlers run:
+//   - no delusion: dying of age is not carelessness (samsara_karma.js);
+//   - ripening records no death, so the next one is not read as a "rapid repeat" of it
+//     (samsara_decay.js, opts.oldAge).
+// The mark is set around the blow only: LivingEntity.hurt -> die posts the death event
+// synchronously, inside attack(), so every death handler runs while it is set.
+//
+// THE BLOW is Samsara's own damage type, samsara:old_age (kubejs/data/samsara/damage_type/;
+// "<player> died of old age"), in minecraft:bypasses_invulnerability -- so a preta's ghost
+// guard, creative mode and the totem of undying (it refuses a source with that tag) cannot
+// hold it back -- and bypasses_armor / _resistance / _effects / _enchantments / _shield,
+// no_impact, no_knockback (kubejs/data/minecraft/tags/damage_type/; generic_kill is in
+// four of them). DamageSources.source(ResourceKey) is PRIVATE (read from the
+// 1.21.1 jar), so the source is built as vanilla builds it: new DamageSource(Holder), the
+// holder from the registry access. If the type cannot be read (a damage type is a datapack
+// registry, loaded with the world) the blow is vanilla generic_kill, /kill's own source,
+// in the same bypass tag. The amount is far past any health and golden hearts.
+const OLD_AGE_DAMAGE = 1e9
+const DamageSourceClass = loadVanilla('net.minecraft.world.damagesource.DamageSource')
+const VanillaRegistriesClass = loadVanilla('net.minecraft.core.registries.Registries')
+const ResourceKeyClass = loadVanilla('net.minecraft.resources.ResourceKey')
+
+global.SMS.oldAgeDying = global.SMS.oldAgeDying || {}
+global.SMS.diesOfOldAge = player => {
     try {
-        keysKept = global.SMS.graves ? global.SMS.graves.keysKept(player) : 0
+        return global.SMS.oldAgeDying['' + player.uuid] === true
     } catch (ignored) {
-        keysKept = 0
+        return false
     }
-    global.SMS.persistedTag(player).putString(global.SMS.config.nbt.birthRealm, 'human')
+}
+
+var oldAgeTypeWarned = false
+function oldAgeSource(player) {
     try {
-        global.SMS.applyRealmEffects(player)
+        var key = ResourceKeyClass.create(VanillaRegistriesClass.DAMAGE_TYPE, ResourceLocationClass.parse(global.SMS.config.aging.damageType))
+        var holder = player.registryAccess().registryOrThrow(VanillaRegistriesClass.DAMAGE_TYPE).getHolderOrThrow(key)
+        return new DamageSourceClass(holder)
     } catch (e) {
-        console.warn(`[Samsara] ${name}: lifting the preta's rules failed: ${e}`)
+        if (!oldAgeTypeWarned) {
+            oldAgeTypeWarned = true
+            console.warn(`[Samsara] the old-age damage type is unreadable; old age kills as /kill does: ${e}`)
+        }
+        return player.damageSources().genericKill()
     }
-    console.info(`[Samsara] ${name}: the preta's craving is spent -- human again`)
+}
+
+// Deal the blow. True when the player died. False when it did not land -- a player
+// changing dimension is invulnerable to everything -- and agingStep then tries again on
+// the next pass; warned once per player, as it would otherwise repeat five times a second.
+global.SMS.oldAgeMissWarned = global.SMS.oldAgeMissWarned || {}
+global.SMS.dieOfOldAge = player => {
+    const id = '' + player.uuid
+    const name = player.profile.name
+    const source = oldAgeSource(player)
+    global.SMS.oldAgeDying[id] = true
     try {
-        player.tell(Text.yellow('The craving is spent. You are human again.'))
-        if (keysKept > 0) player.tell(Text.gray('  Your grave\'s key is in your hands again: it opens your grave, or takes you to it.'))
+        player.attack(source, OLD_AGE_DAMAGE)
+    } catch (e) {
+        console.warn(`[Samsara] ${name}: the old-age blow failed: ${e}`)
+    } finally {
+        delete global.SMS.oldAgeDying[id]
+    }
+    var dead = false
+    try {
+        dead = !(Number(player.getHealth()) > 0)
+    } catch (ignored) {
+        dead = false
+    }
+    if (!dead) {
+        if (!global.SMS.oldAgeMissWarned[id]) {
+            global.SMS.oldAgeMissWarned[id] = true
+            console.warn(`[Samsara] ${name}: Aging ran out but the old-age blow did not land; trying again each pass`)
+        }
+        return false
+    }
+    delete global.SMS.oldAgeMissWarned[id]
+    console.info(`[Samsara] ${name} died of old age`)
+    try {
+        player.tell(Text.gray('Your life has run its course.'))
     } catch (ignored) {
         // messaging is best-effort
     }
+    return true
 }
 
-// One step of a running clock: re-arm the halving once the belly has emptied, count
-// down, and end the preta's time when it runs out. Ends only on the step that crosses
-// zero, so a player with no clock (0) is never touched by it.
-function pretaLifeStep(player, life, ticks) {
+// Set what is left of the player's life to `ticks` (at least 1) and redraw Aging for it
+// -- /karma life, for testing. False for a liberated player: they no longer age.
+global.SMS.setAgingLeft = (player, ticks) => {
+    if (global.SMS.isLiberated(player)) return false
+    var left = Math.max(1, Math.floor(Number(ticks) || 0))
+    global.SMS.persistedTag(player).putDouble(global.SMS.config.nbt.agingLeft, left)
+    giveAging(player, left, true)
+    return true
+}
+
+// One step of the clock: re-arm a preta's halving once the belly has emptied, count down,
+// re-give the effect about once a second, and end the life on the step that crosses zero.
+// Returns what is left: 0 for no clock -- a player with none is never touched -- and -1
+// after a death, so the realm tick does nothing more for the dead.
+//
+// At zero the clock is held at ONE tick until the blow lands, so a blow that does not is
+// tried again on the next pass; the death zeroes it (resetLifeCounters, at the death, and
+// here once more after it), so the next birth starts a full span.
+function agingStep(player, fx, ticks) {
     const nbt = global.SMS.config.nbt
     const tag = global.SMS.persistedTag(player)
-    var left = Number(tag.getDouble(nbt.pretaLife))
-    if (!isFinite(left) || left <= 0) return
-    var food = Number(player.foodLevel)
-    if (isFinite(food) && food <= life.rearmFood) tag.putDouble(nbt.pretaHalveArmed, 1)
+    var left = Number(tag.getDouble(nbt.agingLeft))
+    if (!isFinite(left) || left <= 0) return 0
+    var halving = fx.fullMealHalvesAging
+    if (halving && halving.rearmFood !== undefined) {
+        var food = Number(player.foodLevel)
+        if (isFinite(food) && food <= halving.rearmFood) tag.putDouble(nbt.agingHalveArmed, 1)
+    }
     left = left - ticks
     if (left <= 0) {
-        tag.putDouble(nbt.pretaLife, 0)
-        endPretaLife(player)
-        return
+        tag.putDouble(nbt.agingLeft, 1)
+        if (!global.SMS.dieOfOldAge(player)) return 1
+        tag.putDouble(nbt.agingLeft, 0)
+        return -1
     }
-    tag.putDouble(nbt.pretaLife, left)
-    if (left % 20 < ticks) giveLifeEffects(player, life, left, false)
+    tag.putDouble(nbt.agingLeft, left)
+    if (left % 20 < ticks) giveAging(player, left, false)
+    return left
 }
 
-// A meal filled the bar: halve what is left, if the belly has emptied since the last
-// time (or since birth). Never below one tick, so the next step still ends the life.
-function halvePretaLife(player, life) {
+// A preta's meal filled the bar: halve what is left of the life, if the belly has emptied
+// since the last time (or since birth). Never below one tick, so the next step still ends
+// the life.
+function halveAging(player) {
     const nbt = global.SMS.config.nbt
     const tag = global.SMS.persistedTag(player)
-    var left = Number(tag.getDouble(nbt.pretaLife))
+    var left = Number(tag.getDouble(nbt.agingLeft))
     if (!isFinite(left) || left <= 0) return false
-    if (!(tag.getDouble(nbt.pretaHalveArmed) > 0)) {
+    if (!(tag.getDouble(nbt.agingHalveArmed) > 0)) {
         if (global.SMS.config.debugFood) console.info(`[Samsara] preta: ${player.profile.name} full, but not hungry since the last halving`)
         return false
     }
     var half = Math.floor(left / 2)
     if (half < 1) half = 1
-    tag.putDouble(nbt.pretaLife, half)
-    tag.putDouble(nbt.pretaHalveArmed, 0)
-    giveLifeEffects(player, life, half, true)
+    tag.putDouble(nbt.agingLeft, half)
+    tag.putDouble(nbt.agingHalveArmed, 0)
+    giveAging(player, half, true)
     console.info(`[Samsara] preta: ${player.profile.name} ate to the full -- the life halves, ${minutesSeconds(left)} -> ${minutesSeconds(half)}`)
     try {
         player.tell(Text.gray(`Full, for a moment. Half of this life falls away: ${minutesSeconds(half)} remain.`))
     } catch (ignored) {
         // messaging is best-effort
     }
+    return true
+}
+
+// ---- The deva's gifts that are not attributes (realmEffects.deva) ----------------------
+//
+// The radiance carries Speed, Haste, Jump Boost, Luck, Water Breathing and the golden-heart
+// CAP as attribute modifiers (startup_scripts/samsara_effects.js). These have none, so the
+// realm tick does them; Resistance and Fire Resistance are the two native hooks at the end
+// of this file.
+
+// Golden hearts (absorption): filled to `amount`, never lowered, at birth and every
+// `everyTicks` of the life lived. setAbsorptionAmount clamps to the max_absorption
+// attribute (LivingEntity, 1.21.1), which the radiance raises to 16 -- so this runs AFTER
+// the radiance is given, never before.
+function fillAbsorption(player, a) {
+    var want = Number(a.amount)
+    if (!isFinite(want) || want <= 0) return false
+    var cur = Number(player.getAbsorptionAmount())
+    if (isFinite(cur) && cur >= want) return false
+    player.setAbsorptionAmount(want)
+    return true
+}
+
+// Regeneration: `amount` health, while below max -- as vanilla's RegenerationMobEffect.
+function healStep(player, h) {
+    var health = Number(player.getHealth())
+    var max = Number(player.getMaxHealth())
+    if (!isFinite(health) || !isFinite(max) || health >= max) return false
+    player.heal(Number(h.amount))
     return true
 }
 
@@ -409,17 +621,28 @@ function readMaxHealth(player) {
 // effect that writes something persistent MUST be undone here, not just skipped while
 // the new realm is active.
 //
-// Registry of what is stored vs live, as of 2026-10-22 (1.21.1):
+// Registry of what is stored vs live, as of 2026-10-25 (1.21.1):
 //   maxHealth       STORED attribute        -> reset by applyRealmEffects (new value),
 //                                              or left to a worn creature body
 //   body            STORED Woodwalkers shape -> set by applyRealmEffects every birth:
 //                                              the new creature, or back to the player
 //   adventureMode   STORED game mode        -> set or put back by applyRealmEffects
 //                                              (only what Samsara set: nbt.adventureSet)
-//   hungerEffect    STORED mob effect       -> cleared below
-//   life effects    STORED mob effects      -> cleared below; re-given from the clock
-//   life clock      STORED nbt.pretaLife    -> zeroed by applyRealmEffects outside a
-//                                              preta life, and at death (resetLifeCounters)
+//   effect          STORED mob effect, with -> cleared below when the realm whose effect
+//                   no end (and the            it is (nbt.effectsOf) is not the realm
+//                   attribute modifiers it     applied now; the modifiers go with it.
+//                   carries)                   Re-given by the realm tick
+//   aging clock     STORED nbt.agingLeft    -> zeroed at death (resetLifeCounters) and at
+//   + the Aging     and a mob effect           liberation; a new birth starts a full span
+//     effect                                   and REPLACES the effect (applyRealmEffects)
+//   golden hearts   STORED absorption       -> capped by the radiance's max_absorption, so
+//                                              they go when the radiance does
+//   body re-send    QUEUED global.SMS.bodySync -> re-queued by every applyRealmEffects;
+//                                              sends whatever body birthRealm says then
+//   torment, heal,  live checks (the realm tick) -> no teardown needed
+//   exhaustion
+//   resistance,     live checks (native hooks) -> no teardown needed
+//   fireImmune
 //   notify cooldown STORED throttle         -> cleared below
 //   grave keys      STORED in Samsara's keep outside a human life (nbt.graveKeys)
 //                                           -> synced by applyRealmEffects
@@ -432,33 +655,33 @@ function readMaxHealth(player) {
 //   foodPerMeal     live check, corrected inside the meal itself -> nothing stored
 // (The 1.20.1 pendingFoodPenalty queue is gone: the meal is now corrected inside
 // foodEaten, so nothing is queued that could land on the next body.)
-global.SMS.clearPreviousLife = player => {
+// `now` is the realm whose rules are applied next ('' for none: liberation).
+global.SMS.clearPreviousLife = (player, now) => {
     var cleared = []
 
-    // The renewed hunger effect, and a preta life's effects, are STORED state on the
-    // player: a MobEffect persists until it lapses or is removed, so a preta reborn as
-    // a human would otherwise keep starving -- and keep the Hungry Ghost of a life it
-    // no longer has. Removed unconditionally rather than only for ex-pretas: /effect clear
-    // on an effect you do not have is a no-op, and this must also undo an effect
-    // applied before a config change. A living preta has its life effects given back
-    // straight after, by applyRealmEffects, from the clock.
+    // A realm's effect is STORED state on the player, and has no end: a MobEffect persists
+    // until it is removed, so a preta reborn as a human without a death (/karma realm)
+    // would otherwise keep the Insatiable Craving of a life it no longer has. (A death
+    // clears every effect in vanilla -- the respawned player is a new entity, and effects
+    // are not copied to it.) It is cleared for the realm whose effect Samsara gave LAST
+    // (nbt.effectsOf), and only when that is not the realm applied now, so a LOGIN clears
+    // nothing -- and never a human's own potions. (The 10-22 hunger effect was cleared
+    // unconditionally at every apply, a human's Hunger from rotten flesh included; the
+    // hunger is Samsara's own exhaustion since 2026-10-25, so there is no effect to clear.)
     try {
         if (player.isPlayer()) {
-            global.SMS.serverCommand(player, 'effect clear @s minecraft:hunger')
-            cleared.push('hungerEffect')
-            var realms = global.SMS.config.realmEffects
-            var names = Object.keys(realms)
-            for (var i = 0; i < names.length; i++) {
-                var life = realms[names[i]].life
-                if (!life) continue
-                for (var j = 0; j < life.effects.length; j++) {
-                    global.SMS.serverCommand(player, 'effect clear @s ' + life.effects[j].id)
-                }
-                cleared.push(names[i] + 'LifeEffects')
+            var tag = global.SMS.persistedTag(player)
+            var key = global.SMS.config.nbt.effectsOf
+            var prev = global.SMS.nbtString(tag, key)
+            if (prev && prev !== '' + (now || '')) {
+                var ids = realmEffectIds(global.SMS.effectsFor(prev))
+                for (var j = 0; j < ids.length; j++) global.SMS.serverCommand(player, 'effect clear @s ' + ids[j])
+                tag.putString(key, '')
+                cleared.push(prev + 'Effects')
             }
         }
     } catch (ignored) {
-        // no server to run it on; the effect lapses on its own
+        // no server to run it on; the effect stays until milk or a death clears it
     }
 
     // The anti-spam timer for refusal messages. Harmless, but a stale entry means the
@@ -482,7 +705,7 @@ global.SMS.applyRealmEffects = player => {
     // A liberated player is outside the cycle, so realm penalties no longer apply --
     // the project notes' liberation section lists realm penalties among the things turned
     // off. An empty effects table makes the code below reset maxHealth to vanilla 20,
-    // put back Adventure mode, stop a preta clock, and leaves every live-checked
+    // put back Adventure mode, end Aging for good, and leaves every live-checked
     // restriction (crafting, containers, damage, pickup) reading as absent, which is
     // exactly the intended teardown. Routing
     // the liberation case through the SAME path rather than returning early is what
@@ -495,13 +718,30 @@ global.SMS.applyRealmEffects = player => {
     }
 
     const fx = liberated ? {} : global.SMS.effectsFor(realm)
-    const target = fx.maxHealth === undefined ? VANILLA_MAX_HEALTH : fx.maxHealth
+    const target = maxHealthTarget(fx)
 
     // Tear down stored state from the life that just ended, BEFORE applying the new
     // realm's effects. Note maxHealth is handled by the set below rather than here:
     // it is always written to the NEW realm's value (defaulting to vanilla 20), so a
     // realm with no maxHealth entry actively resets it rather than inheriting.
-    const cleared = global.SMS.clearPreviousLife(player)
+    const cleared = global.SMS.clearPreviousLife(player, liberated ? '' : realm)
+
+    // ADVENTURE MODE FIRST: set for a realm that wants it, put back when it no longer
+    // does (a liberated player's fx is empty, so liberation puts it back too).
+    //
+    // BEFORE THE BODY, because both write the player's flight. Writers of
+    // Abilities.mayfly: vanilla's setGameMode (GameType.updatePlayerAbilities sets it
+    // false for survival and adventure -- read from the 1.21.1 jar), and Woodwalkers'
+    // shape switch (FlightHelper.grantFlightTo for a flying shape; revokeFlight leaving
+    // one). Found in game 2026-10-24: a bird-born player could not fly -- the body went
+    // on (flight granted) and Adventure mode went on after it (flight taken away).
+    var modeNote = ''
+    try {
+        modeNote = applyGameMode(player, fx.adventureMode === true)
+    } catch (e) {
+        console.warn(`[Samsara] could not set the game mode of ${player.profile.name}: ${e}`)
+        modeNote = 'failed'
+    }
 
     // THE BODY, then max health -- in that order, here, because both write max health.
     // Writers of the max-health base value: Woodwalkers (from the creature, on every
@@ -535,45 +775,58 @@ global.SMS.applyRealmEffects = player => {
         }
     }
 
-    // ADVENTURE MODE: set for a realm that wants it, put back when it no longer does
-    // (a liberated player's fx is empty, so liberation puts it back too).
-    var modeNote = ''
+    // THE REALM'S EFFECT (the Torment, the Craving, the Radiance), for the whole life:
+    // given at once, renewed by the realm tick.
     try {
-        modeNote = applyGameMode(player, fx.adventureMode === true)
+        giveRealmEffect(player, fx)
     } catch (e) {
-        console.warn(`[Samsara] could not set the game mode of ${player.profile.name}: ${e}`)
-        modeNote = 'failed'
+        console.warn(`[Samsara] could not give the realm effect of ${player.profile.name}: ${e}`)
     }
 
-    // THE PRETA LIFE: start the clock at the birth (it is 0 then: resetLifeCounters
-    // zeroes it at death, and /karma realm before re-applying), keep it at a login, and
-    // stop it outside a living preta. The effects are given from it at once, so they
-    // stand from the first second rather than from the next tick.
-    var lifeNote = ''
+    // AGING, every life's clock (config.aging): start a full span at a birth (the clock is
+    // 0 then -- resetLifeCounters zeroes it at death, and /karma realm before re-applying),
+    // keep it at a login, and end it for good at liberation. A new span REPLACES the Aging
+    // effect -- /effect give cannot shorten one still running from the life before (a
+    // /karma realm birth, which has no death to clear it).
+    //
+    // A deva's first golden hearts come after, because the radiance given just above is
+    // what raises their cap (fillAbsorption).
+    var agingNote = ''
     try {
         var nbt = global.SMS.config.nbt
         var tag = global.SMS.persistedTag(player)
-        var lifeLeft = Number(tag.getDouble(nbt.pretaLife))
-        if (fx.life) {
-            if (!(lifeLeft > 0)) {
-                lifeLeft = fx.life.ticks
-                tag.putDouble(nbt.pretaLife, lifeLeft)
-                tag.putDouble(nbt.pretaHalveArmed, 0)
-                lifeNote = ` life=${minutesSeconds(lifeLeft)} (new)`
-            } else {
-                lifeNote = ` life=${minutesSeconds(lifeLeft)} left`
+        var agingLeft = Number(tag.getDouble(nbt.agingLeft))
+        if (liberated) {
+            if (agingLeft > 0) {
+                tag.putDouble(nbt.agingLeft, 0)
+                cleared.push('aging')
             }
-            giveLifeEffects(player, fx.life, lifeLeft, false)
-        } else if (lifeLeft > 0) {
-            tag.putDouble(nbt.pretaLife, 0)
-            cleared.push('pretaLife')
+            global.SMS.serverCommand(player, 'effect clear @s ' + agingEffectId())
+            agingNote = ' aging=none (liberated)'
+        } else {
+            var fresh = !(agingLeft > 0)
+            if (fresh) {
+                agingLeft = agingSpan(realm)
+                tag.putDouble(nbt.agingLeft, agingLeft)
+                tag.putDouble(nbt.agingHalveArmed, 0)
+            }
+            giveAging(player, agingLeft, fresh)
+            agingNote = ` aging=${minutesSeconds(agingLeft)}` + (fresh ? ' (new)' : ' left')
+            if (fresh && fx.absorption) fillAbsorption(player, fx.absorption)
         }
     } catch (e) {
-        console.warn(`[Samsara] could not set the preta life of ${player.profile.name}: ${e}`)
+        console.warn(`[Samsara] could not set the Aging of ${player.profile.name}: ${e}`)
+    }
+
+    // Which realm's effect Samsara has now given, for the next teardown.
+    try {
+        if (realmEffectIds(fx).length > 0) global.SMS.persistedTag(player).putString(global.SMS.config.nbt.effectsOf, realm)
+    } catch (ignored) {
+        // the next teardown then clears nothing of this realm's
     }
 
     // GRAVE KEYS: held only in a human life (config.graves). Synced at EVERY apply --
-    // a birth, a login, /karma realm, liberation, a preta's end -- so they follow
+    // a birth, a login, /karma realm, liberation -- so they follow
     // birthRealm the moment it changes. Last, because it reads the liberation flag and
     // birthRealm this call has just acted on. A respawn syncs once more a tick later
     // (samsara_tombstone.js): Tombstone hands keys back at LOWEST priority, after this.
@@ -585,6 +838,13 @@ global.SMS.applyRealmEffects = player => {
         keyNote = 'failed'
     }
 
+    // The body once more, a second from now (resyncBody above).
+    try {
+        queueBodySync(player)
+    } catch (ignored) {
+        // the birth's own switch stands
+    }
+
     // Log loudly enough that the next in-game test can CONFIRM this landed, rather
     // than us inferring it from the health bar. Reads back the attribute afterwards.
     var after = readMaxHealth(player)
@@ -594,7 +854,7 @@ global.SMS.applyRealmEffects = player => {
                 ? ` maxHealth=${after} (the body's)`
                 : ` maxHealth target=${target} before=${current} after=${after} (setMaxHealth called: ${applied})`) +
             (modeNote ? ` mode=${modeNote}` : '') +
-            lifeNote +
+            agingNote +
             (keyNote ? ` keys=${keyNote}` : '') +
             (cleared.length > 0 ? ` [cleared from previous life: ${cleared.join(', ')}]` : '')
     )
@@ -944,12 +1204,11 @@ global.SMS.tellBirthRules = player => {
         var realm = global.SMS.birthRealmOf(player)
         var lines = []
         if (realm === 'preta') {
-            var life = global.SMS.effectsFor('preta').life
             lines = [
                 'You are born a hungry ghost' + (hauntsGrave(player) ? ', where you last died as a human.' : '.'),
-                '  Nothing can harm you, and nothing hunts you. This life lasts ' + (life ? minutesSeconds(life.ticks) : '?') + ', as long as your Hungry Ghost.',
-                '  You can hold only food, and each meal is one crumb. Go hungry, then eat until full, and half of what remains falls away.',
-                '  You cannot build, break, open containers, or open a grave. When the craving is spent you are human again, and your grave is yours.',
+                '  Nothing can harm you, and nothing hunts you. Your Insatiable Craving never leaves you: always slow, weak and starving.',
+                '  You can hold only food, and each meal is one crumb. Go hungry, then eat until full, and half of what remains of this life falls away.',
+                '  You cannot build, break, open containers, or open a grave.',
             ]
         } else if (realm === 'animal') {
             var diet = dietOfPlayer(player)
@@ -958,7 +1217,27 @@ global.SMS.tellBirthRules = player => {
             if (diet !== 'herbivore') lines.push('  You can pick up and eat only meat.')
             if (diet === 'herbivore') lines.push('  You can pick up nothing. A herbivore that lets a predator take it, without fighting back, gives the gift of its body.')
             lines.push('  You cannot build, break, craft, or open containers.')
+        } else if (realm === 'deva') {
+            lines = [
+                'You are born a deva, in the Radiance of the Blessed.',
+                '  All this life you mend, endure and move as no human can; fire cannot harm you, and no creature will hunt you.',
+            ]
+        } else if (realm === 'naraka') {
+            var t = global.SMS.effectsFor('naraka').torment
+            lines = [
+                'You are born in Naraka, in Self-wrought Torment.',
+                '  Your body is halved. You wither, slow, weak and starving, and your tools bite slowly.',
+                '  The torment is your own, and it will not end you: it never takes you below ' + (t ? t.floorHealth / 2 : '?') + ' heart.',
+            ]
+        } else if (realm === 'asura') {
+            lines = ['You are born an asura, at the foot of the mountains of heaven.']
+        } else if (realm === 'brahma') {
+            lines = ['You are born in the Brahma realm.']
+        } else {
+            lines = ['You are born human.']
         }
+        // Every birth ages (config.aging).
+        lines.push('  Aging: this life lasts ' + spanWords(agingSpan(realm)) + ' of play. When it runs out, you die of old age.')
         for (var i = 0; i < lines.length; i++) player.tell(i === 0 ? Text.yellow(lines[i]) : Text.gray(lines[i]))
     } catch (ignored) {
         // messaging is best-effort
@@ -994,10 +1273,11 @@ global.SMS.tellBirthRules = player => {
 // at worst one point high, which can only ever give the preta a point, never take one.
 //
 // Writers of foodLevel, in tick order (the project notes: enumerate the writers before
-// constraining a value): vanilla FoodData.tick (exhaustion and regen; the hunger
-// effect adds exhaustion) -> vanilla FoodData.eat (the meal) -> THIS correction,
-// inside the same eat() call. The preta tick below only READS the bar (the record,
-// and the halving's re-arm). Nothing clamps it any more.
+// constraining a value): vanilla FoodData.tick (exhaustion and regen; Samsara's realm
+// tick adds the Insatiable Craving's exhaustion, which FoodData.tick then spends) ->
+// vanilla FoodData.eat (the meal) -> THIS correction, inside the same eat() call. The
+// realm tick otherwise only READS the bar (the record, and the halving's re-arm).
+// Nothing clamps it any more.
 global.SMS.pretaLastFood = global.SMS.pretaLastFood || {}
 
 ItemEvents.foodEaten(event => {
@@ -1095,27 +1375,58 @@ ItemEvents.foodEaten(event => {
         }
 
         // A full belly halves what is left of the life (if it has gone hungry since).
-        if (next >= 20 && fx.life) halvePretaLife(player, fx.life)
+        if (next >= 20 && fx.fullMealHalvesAging) halveAging(player)
     } catch (e) {
         console.warn(`[Samsara] foodEaten: preta correction failed: ${e}`)
     }
 })
 
-// ---- The preta tick: hunger, the bar record, the life clock --------------------
+// ---- The realm tick: the body re-send, the bar record, Aging, hunger, the realm's
+// effect, the torment, healing, golden hearts -----------------------------------------
 ServerEvents.tick(event => {
-    global.SMS.pretaCounter++
-    if (global.SMS.pretaCounter >= PRETA_INTERVAL_TICKS) {
-        global.SMS.pretaCounter = 0
-        global.SMS.pretaTick(event.server)
+    global.SMS.realmCounter++
+    if (global.SMS.realmCounter >= REALM_INTERVAL_TICKS) {
+        global.SMS.realmCounter = 0
+        global.SMS.realmTick(event.server)
     }
 })
 
-// Every PRETA_INTERVAL_TICKS, for each online player born into a realm with these
-// effects:
+// SELF-WROUGHT TORMENT's withering (realmEffects.naraka.torment): `damage` as vanilla's
+// own wither damage source -- Entity.damageSources().wither(), dealt through KubeJS's
+// attack(DamageSource, float), which is vanilla hurt() (read from the 1.21.1 and KubeJS
+// jars) -- but only when it leaves the player at floorHealth or more. A blow that would
+// cross the floor is not dealt at all, so the torment can never kill (the user chose
+// "hurts, never kills", 2026-10-24). The floor is at least 1 whatever the config says.
+// Logged once per player per session, so the in-game test can see it land.
+global.SMS.tormentLogged = global.SMS.tormentLogged || {}
+global.SMS.tormentStep = (player, t) => {
+    var health = Number(player.getHealth())
+    var dmg = Number(t.damage)
+    var floor = Math.max(Number(t.floorHealth) || 0, 1)
+    if (!isFinite(health) || !isFinite(dmg) || dmg <= 0) return false
+    if (health - dmg < floor) return false
+    player.attack(player.damageSources().wither(), dmg)
+    var id = '' + player.uuid
+    if (!global.SMS.tormentLogged[id]) {
+        global.SMS.tormentLogged[id] = true
+        console.info(`[Samsara] torment: ${player.profile.name} withers, health ${health} -> ${player.getHealth()} (never below ${floor})`)
+    }
+    return true
+}
+
+// Every REALM_INTERVAL_TICKS, for each online player:
+//   0. send the body once more, when its re-send falls due (resyncBody; liberated
+//      players too -- they are put back in their own body);
+// and for each one not liberated:
 //   1. record the bar, for the meal correction above (foodPerMeal);
-//   2. renew the permanent hunger effect before it lapses (hungerEffect);
-//   3. run the life clock (life): re-arm the halving, count down, re-give the effects
-//      about once a second, and end the life when it runs out.
+//   2. run Aging (every realm): re-arm a preta's halving, count down, re-give the effect
+//      about once a second, and die of old age when it runs out. FIRST of the life's
+//      rules, so a player who has just died gets none of the rest;
+//   3. add vanilla Hunger's food exhaustion (exhaustion);
+//   4. give the realm's effect again, every EFFECT_EVERY_PASSES passes (effect);
+//   5. wither, every torment.everyTicks (torment);
+//   6. heal, every heal.everyTicks (heal);
+//   7. fill the golden hearts, every absorption.everyTicks of the life (absorption).
 //
 // WHY /effect AND NOT getPotionEffects().add(). Jar-verified 2026-10-18 on KubeJS 6:
 // EntityPotionEffectsJS.add's overloads all take a net.minecraft MobEffect OBJECT
@@ -1130,7 +1441,9 @@ ServerEvents.tick(event => {
 // NOTE the /effect command takes SECONDS, while the config carries TICKS (every other
 // duration in this pack is in ticks, and mixing the two units is how this goes wrong
 // silently). The conversion happens where the command is built, once.
-global.SMS.pretaTick = server => {
+global.SMS.realmTick = server => {
+    global.SMS.realmPasses++
+    const passes = global.SMS.realmPasses
     var players = null
     try {
         players = server.players
@@ -1156,6 +1469,17 @@ global.SMS.pretaTick = server => {
         }
         if (!player) continue
 
+        // 0. The body's re-send, when due.
+        try {
+            var due = global.SMS.bodySync['' + player.uuid]
+            if (due !== undefined && (global.SMS.tickClock || 0) >= due) {
+                delete global.SMS.bodySync['' + player.uuid]
+                resyncBody(player)
+            }
+        } catch (e) {
+            console.warn(`[Samsara] body re-sync failed for ${player.profile.name}: ${e}`)
+        }
+
         // Liberation turns realm penalties off. These effects are numbers and objects,
         // not boolean flags, so hasEffect() does not cover them and they need the same
         // explicit guard the meal does.
@@ -1167,9 +1491,11 @@ global.SMS.pretaTick = server => {
         }
         if (freed) continue
 
+        var realm = ''
         var fx = null
         try {
-            fx = global.SMS.effectsFor(global.SMS.birthRealmOf(player))
+            realm = global.SMS.birthRealmOf(player)
+            fx = global.SMS.effectsFor(realm)
         } catch (ignored) {
             continue
         }
@@ -1185,37 +1511,73 @@ global.SMS.pretaTick = server => {
             }
         }
 
-        // 2. Renew the hunger effect before it lapses, so the icon never flickers.
-        if (fx.hungerEffect) {
+        // 2. Aging, every realm's: count down, re-give the effect, and die of old age when
+        //    it runs out -- in which case nothing more is done for this player.
+        var agingLeft = 0
+        try {
+            agingLeft = agingStep(player, fx, REALM_INTERVAL_TICKS)
+        } catch (e) {
+            console.warn(`[Samsara] aging step failed for ${player.profile.name}: ${e}`)
+        }
+        if (agingLeft < 0) continue
+
+        // 3. Hunger: vanilla Hunger's food exhaustion, for the ticks since the last pass.
+        if (fx.exhaustion) {
             try {
-                var he = fx.hungerEffect
-                var seconds = Math.ceil(Number(he.durationTicks) / 20)
-                if (!isFinite(seconds) || seconds < 1) seconds = 1
-                var amp = Number(he.amplifier)
-                if (!isFinite(amp) || amp < 0) amp = 0
-                // `true` is hideParticles: a permanent effect should not fog the
-                // screen with particles forever. At server permission: /effect is
-                // op-level (see global.SMS.serverCommand).
-                global.SMS.serverCommand(
-                    player, 'effect give @s ' + he.id + ' ' + seconds + ' ' + amp + ' true'
-                )
-            } catch (ignored) {
-                // command seam unavailable; nothing else to try
+                player.causeFoodExhaustion(Number(fx.exhaustion) * REALM_INTERVAL_TICKS)
+            } catch (e) {
+                console.warn(`[Samsara] hunger failed for ${player.profile.name}: ${e}`)
             }
         }
 
-        // 3. The life clock.
-        if (fx.life) {
+        // 4. The realm's effect, given again (it has no end; this undoes milk).
+        if (fx.effect && passes % EFFECT_EVERY_PASSES === 0) {
             try {
-                pretaLifeStep(player, fx.life, PRETA_INTERVAL_TICKS)
+                giveRealmEffect(player, fx)
             } catch (e) {
-                console.warn(`[Samsara] preta life step failed for ${player.profile.name}: ${e}`)
+                console.warn(`[Samsara] realm effect renewal failed for ${player.profile.name}: ${e}`)
+            }
+        }
+
+        // 5. The torment.
+        if (fx.torment && passes % Math.max(1, Math.round(fx.torment.everyTicks / REALM_INTERVAL_TICKS)) === 0) {
+            try {
+                global.SMS.tormentStep(player, fx.torment)
+            } catch (e) {
+                console.warn(`[Samsara] torment failed for ${player.profile.name}: ${e}`)
+            }
+        }
+
+        // 6. Healing (the deva's Regeneration).
+        if (fx.heal && passes % Math.max(1, Math.round(fx.heal.everyTicks / REALM_INTERVAL_TICKS)) === 0) {
+            try {
+                healStep(player, fx.heal)
+            } catch (e) {
+                console.warn(`[Samsara] healing failed for ${player.profile.name}: ${e}`)
+            }
+        }
+
+        // 7. Golden hearts, every absorption.everyTicks of the life lived (the birth gave
+        //    the first, in applyRealmEffects).
+        if (fx.absorption && agingLeft > 0) {
+            try {
+                var lived = agingSpan(realm) - agingLeft
+                if (lived > 0 && lived % fx.absorption.everyTicks < REALM_INTERVAL_TICKS) fillAbsorption(player, fx.absorption)
+            } catch (e) {
+                console.warn(`[Samsara] golden hearts failed for ${player.profile.name}: ${e}`)
             }
         }
     }
+
+    // Drop re-sends for players long gone (a login queues a fresh one).
+    var ids = Object.keys(global.SMS.bodySync)
+    for (var k = 0; k < ids.length; k++) {
+        if ((global.SMS.tickClock || 0) - global.SMS.bodySync[ids[k]] > 24000) delete global.SMS.bodySync[ids[k]]
+    }
 }
 
-// ---- Preta: nothing can harm a ghost (realmEffects.preta.noDamage) -------------
+// ---- Nothing can harm a ghost, and fire cannot harm a deva -------------------------
+// (realmEffects.preta.noDamage, realmEffects.deva.fireImmune)
 //
 // NeoForge's EntityInvulnerabilityCheckEvent is posted from the end of vanilla
 // Entity.isInvulnerableTo (CommonHooks.isEntityInvulnerableTo; read from the NeoForge
@@ -1224,9 +1586,14 @@ global.SMS.pretaTick = server => {
 // consequences, both intended: starving costs a preta no health, and hostile hits on a
 // preta open no endurance encounter (a ghost cannot earn metta by enduring harm).
 //
-// The sources in minecraft:bypasses_invulnerability -- out_of_world (the void) and
-// generic_kill (/kill) -- are let through, as vanilla
-// lets them through creative mode.
+// The sources in minecraft:bypasses_invulnerability -- out_of_world (the void),
+// generic_kill (/kill) and samsara:old_age -- are let through, as vanilla lets them
+// through creative mode: a preta still dies of old age.
+//
+// A DEVA's Fire Resistance (2026-10-25, folded into the radiance) refuses every source in
+// minecraft:is_fire -- fire, lava, burning, campfires, magma, fireballs -- at the same
+// point vanilla's Fire Resistance does (LivingEntity.hurt returns false for an is_fire
+// source while the effect is on).
 //
 // This is a separate seam from the damage hook on purpose: the hard rule is that
 // Samsara never cancels or edits LivingIncomingDamageEvent. Nothing is stored, so
@@ -1244,11 +1611,17 @@ global.SMS.ghostGuard = event => {
     const entity = event.getEntity()
     if (!entity || !entity.isPlayer()) return false
     if (!entity.getServer()) return false
-    if (!hasEffect(entity, 'noDamage')) return false
     const source = event.getSource()
-    if (!source || !DamageTypeTagsClass || source.is(DamageTypeTagsClass.BYPASSES_INVULNERABILITY)) return false
-    event.setInvulnerable(true)
-    return true
+    if (!source || !DamageTypeTagsClass) return false
+    if (hasEffect(entity, 'noDamage') && !source.is(DamageTypeTagsClass.BYPASSES_INVULNERABILITY)) {
+        event.setInvulnerable(true)
+        return true
+    }
+    if (hasEffect(entity, 'fireImmune') && source.is(DamageTypeTagsClass.IS_FIRE)) {
+        event.setInvulnerable(true)
+        return true
+    }
+    return false
 }
 
 // The registration is in a try: a top-level throw here would abort the rest of this
@@ -1260,15 +1633,63 @@ try {
         } catch (e) {
             if (!ghostGuardWarned) {
                 ghostGuardWarned = true
-                console.warn(`[Samsara] preta invulnerability check failed (pretas can be hurt): ${e}`)
+                console.warn(`[Samsara] invulnerability check failed (pretas can be hurt, devas burn): ${e}`)
             }
         }
     })
 } catch (e) {
-    console.error(`[Samsara] could not register the preta invulnerability hook -- pretas can be hurt: ${e}`)
+    console.error(`[Samsara] could not register the invulnerability hook -- pretas can be hurt, devas burn: ${e}`)
 }
 
-// ---- Preta: nothing hunts a ghost (realmEffects.preta.ignoredByMobs) -------------------
+// ---- A deva's Resistance I (realmEffects.deva.resistance) -----------------------------
+//
+// NeoForge's LivingDamageEvent.Pre is posted from LivingEntity.actuallyHurt AFTER armour
+// (getDamageAfterArmorAbsorb) and after vanilla's own Resistance and enchantments
+// (getDamageAfterMagicAbsorb), and BEFORE the golden hearts take their share -- read from
+// neoforge-21.1.264-client.jar. That is exactly where vanilla's Resistance acts, so taking
+// `resistance` off there IS Resistance I (0.2). Skipped, as vanilla's is, for a source in
+// minecraft:bypasses_resistance (old age, /kill, the void).
+//
+// This EDITS damage, and is a different event from karma's damage hook on purpose: that
+// one (LivingIncomingDamageEvent, the RAW damage endurance measures) only observes, and
+// still does -- the incoming amount endurance reads is untouched by this. Nothing is
+// stored; it follows birthRealm and liberation live. Damage is dealt on the server only.
+var blessedShieldWarned = false
+global.SMS.blessedShield = event => {
+    const entity = event.getEntity()
+    if (!entity || !entity.isPlayer()) return false
+    if (!entity.getServer()) return false
+    var liberated = false
+    try {
+        liberated = global.SMS.isLiberated(entity)
+    } catch (ignored) {
+        liberated = false
+    }
+    if (liberated) return false
+    const r = Number(global.SMS.effectsFor(global.SMS.birthRealmOf(entity)).resistance)
+    if (!(r > 0)) return false
+    const source = event.getSource()
+    if (source && DamageTypeTagsClass && source.is(DamageTypeTagsClass.BYPASSES_RESISTANCE)) return false
+    event.setNewDamage(Number(event.getNewDamage()) * Math.max(0, 1 - r))
+    return true
+}
+
+try {
+    NativeEvents.onEvent(Java.loadClass('net.neoforged.neoforge.event.entity.living.LivingDamageEvent$Pre'), event => {
+        try {
+            global.SMS.blessedShield(event)
+        } catch (e) {
+            if (!blessedShieldWarned) {
+                blessedShieldWarned = true
+                console.warn(`[Samsara] the deva's resistance failed (devas take full damage): ${e}`)
+            }
+        }
+    })
+} catch (e) {
+    console.error(`[Samsara] could not register the deva's resistance -- devas take full damage: ${e}`)
+}
+
+// ---- Nothing hunts a ghost, or a deva (realmEffects.<realm>.ignoredByMobs) -------------
 //
 // NeoForge's LivingChangeTargetEvent (read from neoforge-21.1.264): CommonHooks posts it
 // from Mob.setTarget (MOB_TARGET) and from the brain behaviour StartAttacking
@@ -1279,8 +1700,10 @@ try {
 // AI sets its target some other way would still come -- harmlessly, since the ghost guard
 // lets no hit through.
 //
-// This replaces Tombstone's Ghostly Shape for pretas (its tick refills the food bar). Like
-// the ghost guard it follows birthRealm and liberation live, so nothing needs teardown.
+// This replaces Tombstone's Ghostly Shape for pretas (its tick refills the food bar), and
+// since 2026-10-24 it is also why hostile mobs leave a deva be. Like the ghost guard it
+// follows birthRealm and liberation live, so nothing needs teardown. (Any mob, not only a
+// hostile one: a wolf a deva strikes does not turn on it either.)
 var ghostTargetWarned = false
 global.SMS.ghostUntargetable = event => {
     const target = event.getNewAboutToBeSetTarget()
@@ -1297,12 +1720,12 @@ try {
         } catch (e) {
             if (!ghostTargetWarned) {
                 ghostTargetWarned = true
-                console.warn(`[Samsara] preta targeting check failed (mobs can hunt pretas): ${e}`)
+                console.warn(`[Samsara] targeting check failed (mobs can hunt pretas and devas): ${e}`)
             }
         }
     })
 } catch (e) {
-    console.error(`[Samsara] could not register the preta targeting hook -- mobs can hunt pretas: ${e}`)
+    console.error(`[Samsara] could not register the targeting hook -- mobs can hunt pretas and devas: ${e}`)
 }
 
 // SECOND LINE OF DEFENCE FOR CONTAINERS.

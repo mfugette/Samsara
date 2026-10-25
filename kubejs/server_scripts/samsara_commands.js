@@ -148,13 +148,15 @@ ServerEvents.commandRegistry(event => {
             reply(ctx, Text.yellow(`  body: ${bodyForm}  (${global.SMS.animalDietOf(bodyForm) || 'no longer in config'})`))
         }
 
-        // What is left of a preta life, and whether a full belly would halve it now.
-        const lifeLeft = Number(ptag.getDouble(cfg.nbt.pretaLife))
-        if (born === 'preta' && lifeLeft > 0) {
-            var armed = ptag.getDouble(cfg.nbt.pretaHalveArmed) > 0
+        // What is left of this life (Aging, every realm's), and for a preta whether a full
+        // belly would halve it now.
+        const agingLeft = Number(ptag.getDouble(cfg.nbt.agingLeft))
+        if (agingLeft > 0) {
+            var armed = ptag.getDouble(cfg.nbt.agingHalveArmed) > 0
             reply(ctx, Text.yellow(
-                `  preta life: ${global.SMS.minutesSeconds(lifeLeft)} left` +
-                    (armed ? '  (a full belly now halves it)' : '  (a full belly halves it, once you have gone hungry)')
+                `  aging: ${global.SMS.minutesSeconds(agingLeft)} of this life left, then death by old age` +
+                    (!fx.fullMealHalvesAging ? ''
+                        : armed ? '  (a full belly now halves it)' : '  (a full belly halves it, once you have gone hungry)')
             ))
         }
 
@@ -298,14 +300,30 @@ ServerEvents.commandRegistry(event => {
                             global.SMS.persistedTag(target).putString(global.SMS.config.nbt.birthRealm, realm)
                             // A new birth, so a new body (applyRealmEffects picks one
                             // from the stats as they are now when the realm is animal)
-                            // and a fresh preta clock.
+                            // and a full Aging for the new realm.
                             global.SMS.persistedTag(target).putString(global.SMS.config.nbt.animalForm, '')
-                            global.SMS.persistedTag(target).putDouble(global.SMS.config.nbt.pretaLife, 0)
+                            global.SMS.persistedTag(target).putDouble(global.SMS.config.nbt.agingLeft, 0)
                             global.SMS.applyRealmEffects(target)
                             global.SMS.tellBirthRules(target)
 
                             const fx = global.SMS.effectsFor(realm)
                             return reply(ctx, Text.green(`${target.profile.name} is now born-${realm} (${global.SMS.describeEffects(fx)})`))
+                        }))))
+            // /karma life <player> <seconds> — set what is left of the player's life (their
+            // Aging, in any realm) for testing, so the death by old age can be seen without
+            // waiting out the life (2026-10-24; Aging's since 2026-10-25).
+            .then(C.literal('life')
+                .requires(source => source.hasPermission(2))
+                .then(C.argument('target', A.PLAYER.create(event))
+                    .then(C.argument('seconds', A.INTEGER.create(event))
+                        .executes(ctx => {
+                            const target = A.PLAYER.getResult(ctx, 'target')
+                            const seconds = Number(A.INTEGER.getResult(ctx, 'seconds'))
+                            if (!global.SMS.setAgingLeft(target, seconds * 20)) {
+                                ctx.source.sendFailure(Text.red(`${target.profile.name} is liberated: they no longer age.`))
+                                return 1
+                            }
+                            return reply(ctx, Text.green(`${target.profile.name}'s Aging: ${global.SMS.minutesSeconds(seconds * 20)} left`))
                         }))))
             // /karma forcerealm <player> <realm|none> — override WHERE THE PLAYER IS
             // REBORN on their NEXT DEATH.

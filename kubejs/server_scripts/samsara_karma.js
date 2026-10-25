@@ -1370,11 +1370,11 @@ global.SMS.resetLifeCounters = player => {
     const tag = global.SMS.persistedTag(player)
     tag.putDouble(nbt.lifeHostileKills, 0)
     tag.putDouble(nbt.lifeEndured, 0)
-    // A preta's clock belongs to that life (samsara_realms.js starts a fresh one at the
-    // next preta birth). Without this, a preta that died some other way -- the void,
-    // /kill -- would carry the leftover minutes into its next preta life.
-    tag.putDouble(nbt.pretaLife, 0)
-    tag.putDouble(nbt.pretaHalveArmed, 0)
+    // Aging belongs to that life (samsara_realms.js starts a full span at the next birth).
+    // Without this, a player who died some other way would carry the leftover clock into
+    // the next life -- a deva killed after five hours, reborn human, would have one hour.
+    tag.putDouble(nbt.agingLeft, 0)
+    tag.putDouble(nbt.agingHalveArmed, 0)
 }
 
 // Is this death a rapid repeat -- inside ripening.cooldownTicks of the previous one?
@@ -1750,8 +1750,13 @@ EntityEvents.death(event => {
     const player = event.entity
     if (!player || !player.isPlayer()) return
 
-    // (A preta whose craving is spent no longer dies -- it becomes human again,
-    // samsara_realms.js -- so there is no "life ran its course" death to exempt here.)
+    // Dying of OLD AGE is no carelessness: Aging ran out (samsara_realms.js marks the
+    // player for the length of the blow, which is when this runs). Decided 2026-10-25.
+    try {
+        if (global.SMS.diesOfOldAge && global.SMS.diesOfOldAge(player)) return
+    } catch (ignored) {
+        // fall through: treat it as any death with no attacker
+    }
 
     // Was anyone responsible? If a mob or player killed them, this is not
     // carelessness -- it is the ordinary risk of the world.
