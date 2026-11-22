@@ -41,28 +41,17 @@
 /config/*
 !/config/walkers.json5
 
-# Corail Tombstone, cut down to the grave and its key (decided 2026-10-22): its three
-# tomls switch the rest off -- the respawn Ghostly Shape (whose tick refills the food
-# bar a preta lives by), enchantments, potions, magic items, alignment, sieges, events
-# -- and activate_grave_by_sneaking = false closes the one way into a grave Samsara has
-# no event to refuse. Its loot pools are emptied, so nothing of it reaches chests or
-# drops. samsara_tombstone.js does the rest (only humans have graves).
-!/config/tombstone-server.toml
-!/config/tombstone-common.toml
-!/config/tombstone-client.toml
-!/config/tombstone/
-/config/tombstone/*
-!/config/tombstone/loottables/
+# NOT whitelisted, though load-bearing: Corail Tombstone's three tomls and
+# config/tombstone/loottables/ (they cut the mod down to the grave and its key), and
+# config/streamsreflowing.properties (its outletBiomes makes the deva ocean and river
+# stream mouths). Both mods are ALL RIGHTS RESERVED, and these files are the mods' own
+# text, so they stay out of git (2026-11-22) and live only in the instance. The settings
+# Samsara needs are listed in the project notes.
 
-# SparseStructures: Tombstone's abandoned graves set to factor 0 (off).
+# SparseStructures (MIT): Tombstone's abandoned graves set to factor 0 (off).
 !/config/sparsestructures.json5
 
-# Streams Reflowing (2026-10-25): outletBiomes names the deva realm's ocean and river as
-# stream mouths -- the deva biomes are Samsara's own, in none of the vanilla water tags
-# its default list reads, and a stream with no mouth has nowhere to end.
-!/config/streamsreflowing.properties
-
-# Alex's Mobs' spawn config (2026-11-22): where each creature lives. It is the input of
+# Alex's Mobs' spawn config (2026-11-22; LGPL-3.0): where each creature lives. It is the input of
 # gen_animal_homes.py, which writes kubejs/server_scripts/samsara_animal_homes.js,
 # and harness section 34 fails when the two drift apart (a mod update rewriting the config).
 # Untracked, a clone ran the harness at 967/968 and mutate.py could not copy the folder.
@@ -72,6 +61,15 @@
 !/config/alexsmobs/*_spawns.json
 
 # 3. Re-ignore things that live INSIDE the whitelisted trees.
+
+# The deva realm's eight biomes are GENERATED from Terralith's biome files by
+# gen_deva.py. Terralith's jar says "MIT", but the license.txt inside it is
+# the Stardust Labs License, which forbids redistributing modified versions or portions of
+# its datapack -- so they stay out of git (2026-11-22). Run the generator in the instance.
+/kubejs/data/samsara/worldgen/biome/deva_*.json
+
+# The session handoff and the in-game checklist name the player and the Windows home
+# folder: local only (2026-11-22). The rest of the notes folder stays tracked.
 
 # KubeJS writes its Mojang-mapping remapper cache and generated output here.
 # Machine-specific, large, and regenerated on demand.
@@ -106,8 +104,9 @@ desktop.ini
 #                          tracking them invites silent changes.
 #   config/                Game-GENERATED per-mod tomls, rewritten on launch. Not
 #                          source -- except the few load-bearing ones whitelisted
-#                          above (Woodwalkers, Tombstone, SparseStructures,
-#                          Streams Reflowing, Alex's Mobs' spawns).
+#                          above (Woodwalkers, SparseStructures, Alex's Mobs'
+#                          spawns). Tombstone's and Streams Reflowing's are
+#                          load-bearing too, but All Rights Reserved (above).
 #                          Leftovers of removed mods were deleted 2026-10-22.
 #   logs/, crash-reports/  Runtime output. Read constantly during testing --
 #                          the project notes require checking logs/latest.log after
