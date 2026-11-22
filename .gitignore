@@ -19,9 +19,10 @@
 
 # 2. Un-ignore the project.
 
-# The repo's own metadata.
+# The repo's own metadata, and the README.
 !/.gitignore
 !/.gitattributes
+!/README.md
 
 # KubeJS: all of our actual source. Scripts (server/client/startup) plus the
 # datapack JSON that defines the custom realms -- dimension, dimension_type,
