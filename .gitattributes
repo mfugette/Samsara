@@ -8,5 +8,5 @@
 
 # Binary: never touch.
 *.png binary
-# Structure templates are gzip NBT (Mount Sineru: gen_sineru.js).
+# Structure templates are gzip NBT.
 *.nbt binary

@@ -24,19 +24,15 @@
 !/.gitattributes
 
 # KubeJS: all of our actual source. Scripts (server/client/startup) plus the
-# datapack JSON that defines the five custom realms -- dimension,
-# dimension_type, worldgen/biome, worldgen/noise_settings.
+# datapack JSON that defines the custom realms -- dimension, dimension_type,
+# worldgen/biome, worldgen/noise_settings.
 !/kubejs/
 
-# Project documentation and the agent brief. The project notes are the operational
-# brief; the notes folder holds the design docs, the session handoff, and the offline
-# test harness (test_routing.js), all of which are source.
-
-# The ONE load-bearing mod config. Woodwalkers draws an animal-born player as their
+# A load-bearing mod config. Woodwalkers (MIT) draws an animal-born player as their
 # creature, and "apiLevel": 0 (API_ONLY) is what stops any player from unlocking or
-# switching bodies with its keys (the project notes, realm penalties). It is CraftedCore's
-# json5, not a NeoForge toml, so defaultconfigs/ does not apply: whitelisted in
-# place. samsara_realms.js warns at load if the level is anything else.
+# switching bodies with its keys. It is CraftedCore's json5, not a NeoForge toml, so
+# defaultconfigs/ does not apply: whitelisted in place. samsara_realms.js warns at
+# load if the level is anything else.
 !/config/
 /config/*
 !/config/walkers.json5
@@ -45,31 +41,25 @@
 # config/tombstone/loottables/ (they cut the mod down to the grave and its key), and
 # config/streamsreflowing.properties (its outletBiomes makes the deva ocean and river
 # stream mouths). Both mods are ALL RIGHTS RESERVED, and these files are the mods' own
-# text, so they stay out of git (2026-11-22) and live only in the instance. The settings
-# Samsara needs are listed in the project notes.
+# text, so they stay out of git and live only in the instance.
 
 # SparseStructures (MIT): Tombstone's abandoned graves set to factor 0 (off).
 !/config/sparsestructures.json5
 
-# Alex's Mobs' spawn config (2026-11-22; LGPL-3.0): where each creature lives. It is the input of
-# gen_animal_homes.py, which writes kubejs/server_scripts/samsara_animal_homes.js,
-# and harness section 34 fails when the two drift apart (a mod update rewriting the config).
-# Untracked, a clone ran the harness at 967/968 and mutate.py could not copy the folder.
-# Only the *_spawns.json files are read; the four other files beside them are not.
+# Alex's Mobs' spawn config (LGPL-3.0): where each creature lives -- the input that
+# kubejs/server_scripts/samsara_animal_homes.js is generated from. Only the
+# *_spawns.json files are read; the four other files beside them are not.
 !/config/alexsmobs/
 /config/alexsmobs/*
 !/config/alexsmobs/*_spawns.json
 
 # 3. Re-ignore things that live INSIDE the whitelisted trees.
 
-# The deva realm's eight biomes are GENERATED from Terralith's biome files by
-# gen_deva.py. Terralith's jar says "MIT", but the license.txt inside it is
-# the Stardust Labs License, which forbids redistributing modified versions or portions of
-# its datapack -- so they stay out of git (2026-11-22). Run the generator in the instance.
+# The deva realm's eight biomes are GENERATED from Terralith's biome files. Terralith's
+# jar says "MIT", but the license.txt inside it is the Stardust Labs License, which
+# forbids redistributing modified versions or portions of its datapack -- so they stay
+# out of git and are generated in the instance.
 /kubejs/data/samsara/worldgen/biome/deva_*.json
-
-# The session handoff and the in-game checklist name the player and the Windows home
-# folder: local only (2026-11-22). The rest of the notes folder stays tracked.
 
 # KubeJS writes its Mojang-mapping remapper cache and generated output here.
 # Machine-specific, large, and regenerated on demand.
@@ -79,9 +69,6 @@
 # KubeJS 7's local web server config holds an AUTH TOKEN for that server. A secret,
 # and machine-local: never commit it. (client.json / common.json are plain settings.)
 /kubejs/config/web_server.json
-
-# Agent scratch state: per-session transcripts, local settings, tool caches.
-# settings.local.json is explicitly the "not shared" settings file.
 
 # OS metadata, anywhere in the tree.
 .DS_Store
@@ -93,24 +80,21 @@ desktop.ini
 # this is the reasoning, so nobody "helpfully" adds them later.
 #
 #   saves/                 71 MB of binary world data, and the biggest reason
-#                          not to track it: the project notes' hard rule is that save
+#                          not to track it: the pack's hard rule is that save
 #                          files are never deleted or corrupted. Git operations
 #                          (checkout, reset, stash) on a live world directory
 #                          are exactly how that happens. Keep git away from it.
-#   mods/                  Third-party jars. Versions are pinned in the project notes
-#                          and reproducible from minecraftinstance.json; binary
-#                          blobs in git are not how you distribute them. Also
-#                          the project notes require asking before changing mods, and
-#                          tracking them invites silent changes.
+#   mods/                  Third-party jars, reproducible from
+#                          minecraftinstance.json; binary blobs in git are not
+#                          how you distribute them, and tracking them invites
+#                          silent changes.
 #   config/                Game-GENERATED per-mod tomls, rewritten on launch. Not
 #                          source -- except the few load-bearing ones whitelisted
 #                          above (Woodwalkers, SparseStructures, Alex's Mobs'
 #                          spawns). Tombstone's and Streams Reflowing's are
 #                          load-bearing too, but All Rights Reserved (above).
-#                          Leftovers of removed mods were deleted 2026-10-22.
-#   logs/, crash-reports/  Runtime output. Read constantly during testing --
-#                          the project notes require checking logs/latest.log after
-#                          every in-game test -- but never a source artifact.
+#   logs/, crash-reports/  Runtime output. Read after every in-game test, but
+#                          never a source artifact.
 #   local/                 KubeJS dev.properties: machine-local toggles.
 #   rhino.local.properties Carries its own warning in the file: "please do not
 #                          push this to version control".
@@ -128,7 +112,6 @@ desktop.ini
 #   defaultconfigs/        Empty today. Whitelist it if the pack ever ships
 #                          default mod configs -- those WOULD be source.
 
-# Python bytecode, e.g. from importing mutate.py. Must come AFTER
-# the whitelist above, or the notes folder's rule would re-include it.
+# Python bytecode, anywhere in the tree.
 __pycache__/
 *.pyc
