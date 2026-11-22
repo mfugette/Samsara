@@ -58,6 +58,8 @@ global.SMS.describeEffects = fx => {
     if (fx.maxHealth !== undefined) parts.push('max health ' + fx.maxHealth)
     if (fx.noDamage) parts.push('takes no damage')
     if (fx.ignoredByMobs) parts.push('ignored by mobs')
+    if (fx.huntedOnlyByPredators) parts.push('hunted only by its predators')
+    if (fx.unseen) parts.push('seen only by its own kind')
     if (fx.heal) parts.push('mends')
     if (fx.resistance) parts.push('takes ' + Math.round(fx.resistance * 100) + '% less damage')
     if (fx.fireImmune) parts.push('fire cannot harm it')
@@ -651,7 +653,11 @@ function readMaxHealth(player) {
 //   noContainers    live check              -> no teardown needed
 //   noDamage        live check              -> no teardown needed
 //   ignoredByMobs   live check              -> no teardown needed
-//   pickUp          live check              -> no teardown needed
+//   huntedOnlyByPredators live check        -> no teardown needed
+//   unseen          STORED team membership  -> left, and the flag cleared, by
+//                   and invisible flag         applyRealmEffects (applyUnseen: the team
+//                                              is the record)
+//   pickUp         live check              -> no teardown needed
 //   foodPerMeal     live check, corrected inside the meal itself -> nothing stored
 // (The 1.20.1 pendingFoodPenalty queue is gone: the meal is now corrected inside
 // foodEaten, so nothing is queued that could land on the next body.)
@@ -818,6 +824,17 @@ global.SMS.applyRealmEffects = player => {
         console.warn(`[Samsara] could not set the Aging of ${player.profile.name}: ${e}`)
     }
 
+    // UNSEEN BUT BY ITS OWN KIND: join or leave the team, and the invisible flag -- AFTER
+    // the game mode and the body above, both of which reset the flag at once
+    // (onUpdateAbilities; see applyUnseen).
+    var unseenNote = ''
+    try {
+        unseenNote = applyUnseen(player, fx)
+    } catch (e) {
+        console.warn(`[Samsara] could not set who sees ${player.profile.name}: ${e}`)
+        unseenNote = 'failed'
+    }
+
     // Which realm's effect Samsara has now given, for the next teardown.
     try {
         if (realmEffectIds(fx).length > 0) global.SMS.persistedTag(player).putString(global.SMS.config.nbt.effectsOf, realm)
@@ -855,6 +872,7 @@ global.SMS.applyRealmEffects = player => {
                 : ` maxHealth target=${target} before=${current} after=${after} (setMaxHealth called: ${applied})`) +
             (modeNote ? ` mode=${modeNote}` : '') +
             agingNote +
+            (unseenNote ? ` sight=${unseenNote}` : '') +
             (keyNote ? ` keys=${keyNote}` : '') +
             (cleared.length > 0 ? ` [cleared from previous life: ${cleared.join(', ')}]` : '')
     )
@@ -1118,31 +1136,43 @@ BlockEvents.rightClicked(event => {
 // read through those explicit getters, since its `entity` FIELD is the item entity.
 // It fires every tick the player stands on an item, so the refusal is silent.
 
-// Item tags for meat, built once from config.animalBirth.meat.tags.
-var meatTagKeys = null
-function meatTags() {
-    if (meatTagKeys !== null) return meatTagKeys
-    meatTagKeys = []
-    try {
-        var TagKeyClass = Java.loadClass('net.minecraft.tags.TagKey')
-        var RegistriesClass = Java.loadClass('net.minecraft.core.registries.Registries')
-        var ids = ((global.SMS.config.animalBirth || {}).meat || {}).tags || []
-        for (var i = 0; i < ids.length; i++) meatTagKeys.push(TagKeyClass.create(RegistriesClass.ITEM, ResourceLocationClass.parse(ids[i])))
-    } catch (e) {
-        console.warn(`[Samsara] could not build the meat tags; only the listed meat ids count: ${e}`)
-    }
-    return meatTagKeys
+// The tags a registry object is in, from its Holder: {'ns:path': true, ...}. Vanilla's
+// Holder.tags() (a Stream of TagKeys) -- NOT Holder.is(TagKey) or ItemStack.is(TagKey):
+// each has five overloads, and in game 2026-11-06 Rhino sent Holder.is a TagKey through
+// is(ResourceLocation), whose KubeJS wrapper threw "Could not create ID from
+// 'TagKey[...]'" -- every animal home with a tag in it failed its search. tags() has no
+// overload, and TagKey.location() is a record accessor (KubeJS mixes into neither).
+// (DamageSource.is(TagKey) is fine: the ghost guard has never warned in game.)
+global.SMS.tagsOf = holder => {
+    var out = {}
+    var list = holder.tags().toList()
+    for (var i = 0; i < list.size(); i++) out['' + list.get(i).location()] = true
+    return out
 }
 
+// Meat: an id in config.animalBirth.meat.items, or an item in one of its tags (read
+// through tagsOf, above, and kept per item id). A stack that cannot be read is not meat --
+// warned once, since a carnivore refused all vanilla meat would otherwise be silent.
+var meatById = {}
+var meatWarned = false
 function isMeat(stack) {
     try {
-        if ((((global.SMS.config.animalBirth || {}).meat || {}).items || []).indexOf('' + stack.id) !== -1) return true
-        var tags = meatTags()
-        for (var i = 0; i < tags.length; i++) {
-            if (stack.is(tags[i])) return true
+        var meat = (global.SMS.config.animalBirth || {}).meat || {}
+        var id = '' + stack.id
+        if ((meat.items || []).indexOf(id) !== -1) return true
+        if (meatById[id] !== undefined) return meatById[id]
+        var tags = global.SMS.tagsOf(stack.getItemHolder())
+        var hit = false
+        for (var i = 0; i < (meat.tags || []).length; i++) {
+            if (tags[meat.tags[i]] === true) hit = true
         }
-    } catch (ignored) {
-        // unreadable stack: not meat
+        meatById[id] = hit
+        return hit
+    } catch (e) {
+        if (!meatWarned) {
+            meatWarned = true
+            console.warn(`[Samsara] could not read an item's tags; only the listed meat ids count as meat: ${e}`)
+        }
     }
     return false
 }
@@ -1397,7 +1427,9 @@ ServerEvents.tick(event => {
 // jars) -- but only when it leaves the player at floorHealth or more. A blow that would
 // cross the floor is not dealt at all, so the torment can never kill (the user chose
 // "hurts, never kills", 2026-10-24). The floor is at least 1 whatever the config says.
-// Logged once per player per session, so the in-game test can see it land.
+// Logged once per player per session, the first time a blow LANDS, so the in-game test can
+// see it work: on 2026-11-06 the one line went to a blow in creative mode -- "health 10 ->
+// 10" -- and the survival blows after it were never seen.
 global.SMS.tormentLogged = global.SMS.tormentLogged || {}
 global.SMS.tormentStep = (player, t) => {
     var health = Number(player.getHealth())
@@ -1406,17 +1438,19 @@ global.SMS.tormentStep = (player, t) => {
     if (!isFinite(health) || !isFinite(dmg) || dmg <= 0) return false
     if (health - dmg < floor) return false
     player.attack(player.damageSources().wither(), dmg)
+    var after = Number(player.getHealth())
     var id = '' + player.uuid
-    if (!global.SMS.tormentLogged[id]) {
+    if (after < health && !global.SMS.tormentLogged[id]) {
         global.SMS.tormentLogged[id] = true
-        console.info(`[Samsara] torment: ${player.profile.name} withers, health ${health} -> ${player.getHealth()} (never below ${floor})`)
+        console.info(`[Samsara] torment: ${player.profile.name} withers, health ${health} -> ${after} (never below ${floor})`)
     }
     return true
 }
 
 // Every REALM_INTERVAL_TICKS, for each online player:
 //   0. send the body once more, when its re-send falls due (resyncBody; liberated
-//      players too -- they are put back in their own body);
+//      players too -- they are put back in their own body), and set an unseen player's
+//      invisible flag again, which the switch resets (keepUnseen);
 // and for each one not liberated:
 //   1. record the bar, for the meal correction above (foodPerMeal);
 //   2. run Aging (every realm): re-arm a preta's halving, count down, re-give the effect
@@ -1478,6 +1512,13 @@ global.SMS.realmTick = server => {
             }
         } catch (e) {
             console.warn(`[Samsara] body re-sync failed for ${player.profile.name}: ${e}`)
+        }
+
+        // The invisible flag again, at once: the body's switch resets it (keepUnseen).
+        try {
+            global.SMS.keepUnseen(player)
+        } catch (ignored) {
+            // PlayerEvents.tick sets it on the player's own tick
         }
 
         // Liberation turns realm penalties off. These effects are numbers and objects,
@@ -1689,7 +1730,8 @@ try {
     console.error(`[Samsara] could not register the deva's resistance -- devas take full damage: ${e}`)
 }
 
-// ---- Nothing hunts a ghost, or a deva (realmEffects.<realm>.ignoredByMobs) -------------
+// ---- Nothing hunts a ghost, or a deva (realmEffects.<realm>.ignoredByMobs); only its ---
+// ---- predators hunt an animal (realmEffects.animal.huntedOnlyByPredators) --------------
 //
 // NeoForge's LivingChangeTargetEvent (read from neoforge-21.1.264): CommonHooks posts it
 // from Mob.setTarget (MOB_TARGET) and from the brain behaviour StartAttacking
@@ -1704,11 +1746,20 @@ try {
 // since 2026-10-24 it is also why hostile mobs leave a deva be. Like the ghost guard it
 // follows birthRealm and liberation live, so nothing needs teardown. (Any mob, not only a
 // hostile one: a wolf a deva strikes does not turn on it either.)
+//
+// An animal-born player (decided 2026-11-06, the user: "Mobs still attack me as an
+// animal ... This should not happen") is left alone by every mob EXCEPT a predator --
+// a mob the offering of the body counts as one (global.SMS.isPredatorType: a listed
+// predator or a carnivore-tier creature). A zombie does not hunt a deer; a wolf does, and
+// without it no herbivore could ever make the offering.
 var ghostTargetWarned = false
 global.SMS.ghostUntargetable = event => {
     const target = event.getNewAboutToBeSetTarget()
     if (!target || !target.isPlayer()) return false
-    if (!hasEffect(target, 'ignoredByMobs')) return false
+    if (!hasEffect(target, 'ignoredByMobs')) {
+        if (!hasEffect(target, 'huntedOnlyByPredators')) return false
+        if (global.SMS.isPredatorType('' + event.getEntity().type)) return false
+    }
     event.setNewAboutToBeSetTarget(null)
     return true
 }
@@ -1720,13 +1771,98 @@ try {
         } catch (e) {
             if (!ghostTargetWarned) {
                 ghostTargetWarned = true
-                console.warn(`[Samsara] targeting check failed (mobs can hunt pretas and devas): ${e}`)
+                console.warn(`[Samsara] targeting check failed (mobs can hunt pretas, devas and animals): ${e}`)
             }
         }
     })
 } catch (e) {
-    console.error(`[Samsara] could not register the targeting hook -- mobs can hunt pretas and devas: ${e}`)
+    console.error(`[Samsara] could not register the targeting hook -- mobs can hunt pretas, devas and animals: ${e}`)
 }
+
+// ---- Unseen but by its own kind (realmEffects.<realm>.unseen) --------------------------
+//
+// Decided 2026-11-07 (the user): only pretas see pretas. A human sees nothing there; a
+// preta sees itself (third person) and every other preta as a faint ghost. Vanilla does
+// both -- read from the 1.21.1 jars:
+//   - Entity.isInvisibleTo(viewer) is false for a viewer on the entity's own scoreboard
+//     team when that team canSeeFriendlyInvisibles (and for a spectator), and
+//     LivingEntityRenderer then draws the invisible body translucent (itemEntityTranslucentCull,
+//     alpha 0x26, about 15%) -- for anyone else, not at all. So: the invisible flag, and
+//     one team, config.unseenTeam. What the ghost holds still shows, as with the potion.
+//   - Samsara sets the flag itself rather than giving vanilla Invisibility, so the
+//     inventory keeps one realm effect (the Craving).
+//
+// WRITERS of the invisible flag, and why it is set where it is:
+//   - LivingEntity.updateInvisibilityStatus: flag = hasEffect(minecraft:invisibility), run
+//     by tickEffects (server side, inside Player.tick) on the tick after ANY effect changed
+//     -- the realm's and Aging's own re-gives included;
+//   - ServerPlayer.onUpdateAbilities: the same, AT ONCE -- on every game-mode change
+//     (applyGameMode) and on Woodwalkers' body switch (setBody, resyncBody);
+//   - Samsara (keepUnseen): from PlayerEvents.tick -- NeoForge's PlayerTickEvent.Post, so
+//     AFTER tickEffects in the same Player.tick -- and right after the game mode and the
+//     body, in applyRealmEffects and the realm tick.
+// Each level sends changed entity data to clients in its own tick (ServerLevel.tick ->
+// ChunkMap.tick), BEFORE the players tick (the connection tick, after every level). So a
+// reset left until the next player tick reaches every client as a one-tick flash of the
+// ghost: each reset Samsara causes is undone in the same call.
+//
+// The TEAM is the record: a player on it who is no longer unseen (another birth, or
+// liberation) leaves it and is made visible. A player on any other team is not touched.
+
+// The name of the player's scoreboard team, '' for none. Entity.getTeam() (one signature;
+// KubeJS's own teamId/teamName beans are left alone, N9).
+function teamNameOf(player) {
+    var team = player.getTeam()
+    return team ? '' + team.getName() : ''
+}
+
+// Set the flag on an unseen player -- only when it is off: SynchedEntityData sends a
+// change, and this runs every tick. Returns whether the player is unseen.
+global.SMS.keepUnseen = player => {
+    if (!hasEffect(player, 'unseen')) return false
+    if (!player.isInvisible()) player.setInvisible(true)
+    return true
+}
+
+// From applyRealmEffects, with the realm's effects ({} when liberated). The team is made
+// (or re-made) each time a player joins it: `team add` fails harmlessly when it exists,
+// and `modify` puts back the one option it needs. Op commands, so the server's own.
+function applyUnseen(player, fx) {
+    const team = global.SMS.config.unseenTeam
+    const on = teamNameOf(player)
+    if (fx.unseen === true) {
+        var note = 'unseen'
+        if (on !== team) {
+            var server = player.getServer()
+            server.runCommandSilent('team add ' + team)
+            server.runCommandSilent('team modify ' + team + ' seeFriendlyInvisibles true')
+            global.SMS.serverCommand(player, 'team join ' + team + ' @s')
+            note = on ? `unseen (moved from team ${on})` : 'unseen (joined)'
+            // Without the team the flag hides the ghost from pretas and itself as well.
+            if (teamNameOf(player) !== team) note = `unseen, but NOT on ${team}: no one sees it`
+        }
+        player.setInvisible(true)
+        return note
+    }
+    if (on !== team) return ''
+    global.SMS.serverCommand(player, 'team leave @s')
+    // Vanilla's own rule for what is left: a spectator stays invisible. (A vanilla
+    // Invisibility potion comes back with its next effect change.)
+    player.setInvisible(player.isSpectator())
+    return 'seen again'
+}
+
+var unseenWarned = false
+PlayerEvents.tick(event => {
+    try {
+        global.SMS.keepUnseen(event.player)
+    } catch (e) {
+        if (!unseenWarned) {
+            unseenWarned = true
+            console.warn(`[Samsara] could not keep a preta unseen (humans may see it): ${e}`)
+        }
+    }
+})
 
 // SECOND LINE OF DEFENCE FOR CONTAINERS.
 //

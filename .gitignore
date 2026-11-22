@@ -62,6 +62,15 @@
 # its default list reads, and a stream with no mouth has nowhere to end.
 !/config/streamsreflowing.properties
 
+# Alex's Mobs' spawn config (2026-11-22): where each creature lives. It is the input of
+# gen_animal_homes.py, which writes kubejs/server_scripts/samsara_animal_homes.js,
+# and harness section 34 fails when the two drift apart (a mod update rewriting the config).
+# Untracked, a clone ran the harness at 967/968 and mutate.py could not copy the folder.
+# Only the *_spawns.json files are read; the four other files beside them are not.
+!/config/alexsmobs/
+/config/alexsmobs/*
+!/config/alexsmobs/*_spawns.json
+
 # 3. Re-ignore things that live INSIDE the whitelisted trees.
 
 # KubeJS writes its Mojang-mapping remapper cache and generated output here.
@@ -97,7 +106,8 @@ desktop.ini
 #                          tracking them invites silent changes.
 #   config/                Game-GENERATED per-mod tomls, rewritten on launch. Not
 #                          source -- except the few load-bearing ones whitelisted
-#                          above (Woodwalkers, Tombstone, SparseStructures).
+#                          above (Woodwalkers, Tombstone, SparseStructures,
+#                          Streams Reflowing, Alex's Mobs' spawns).
 #                          Leftovers of removed mods were deleted 2026-10-22.
 #   logs/, crash-reports/  Runtime output. Read constantly during testing --
 #                          the project notes require checking logs/latest.log after

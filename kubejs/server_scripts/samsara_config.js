@@ -548,6 +548,13 @@ global.SMS.config = {
             // and cleared every harmful effect -- the hunger, the very thing a preta is.
             ignoredByMobs: true,
 
+            // Only pretas see pretas (decided 2026-11-07, the user): a human sees nothing
+            // there; a preta sees itself (third person) and other pretas as a faint ghost.
+            // Vanilla's invisible flag, plus the team config.unseenTeam
+            // (samsara_realms.js, "Unseen but by its own kind"). No Invisibility effect:
+            // the inventory still shows only the Craving. What it holds still shows.
+            unseen: true,
+
             // A meal that fills the bar to 20 halves what is left of the life (Aging,
             // config.aging), but only once the bar has fallen to `rearmFood` or below
             // since birth or the last halving: the bar is FULL at birth, so without that
@@ -610,8 +617,21 @@ global.SMS.config = {
             adventureMode: true,
             // What it may pick up follows its diet: config.animalBirth.pickUpByDiet.
             pickUp: 'diet',
+            // No mob hunts it but a predator (decided 2026-11-06, the user: zombies
+            // hunted an animal-born player). A predator is what the offering of the body
+            // counts as one (animalBirth.offering: predators, predatorDiets), so a
+            // herbivore can still be taken and make the offering. NeoForge's
+            // LivingChangeTargetEvent, as ignoredByMobs (samsara_realms.js).
+            huntedOnlyByPredators: true,
         },
     },
+
+    // The scoreboard team of every player born into an `unseen` realm (realmEffects.preta),
+    // set to see its friendly invisibles: its members see one another as faint ghosts and
+    // no one else sees them. A player is on it only while unseen -- the team is the record
+    // the teardown reads -- and joining it takes the player off any other team (a scoreboard
+    // holds one team per player).
+    unseenTeam: 'samsara_pretas',
 
     // ---- What an animal birth means beyond the penalties above (2026-10-21) ----------
     animalBirth: {
@@ -677,7 +697,7 @@ global.SMS.config = {
         // reads as an omnivore, so a config gap can never starve a player.
         pickUpByDiet: { herbivore: 'none', omnivore: 'meat', carnivore: 'meat' },
 
-        // What counts as meat: item tags (checked with ItemStack.is) plus explicit ids
+        // What counts as meat: item tags (read with global.SMS.tagsOf) plus explicit ids
         // for modded meats no tag carries. Fish counts: flesh is flesh, and half the
         // carnivore bodies (crocodile, caiman, shoebill, bald eagle) eat fish.
         meat: {
@@ -715,6 +735,16 @@ global.SMS.config = {
             predatorDiets: ['carnivore'],
             blockRapidDeath: true,
         },
+
+        // WHERE A BODY IS BORN FIRST, before the rest of its homes (`homes`, generated
+        // from Alex's Mobs' spawn config into samsara_animal_homes.js). Same format as
+        // `homes`; searched first, and when none is within biomeSearch.radius, the whole
+        // list. The tiger (2026-11-06, the user: born in a cherry grove, "not in the
+        // bamboo jungle as I should have" -- Alex's Mobs also lists cherry and sakura
+        // groves and amethyst biomes for it).
+        preferredHomes: {
+            'alexsmobs:tiger': [['minecraft:bamboo_jungle'], ['biomesoplenty:bamboo_grove']],
+        },
     },
 
     // ---- Graves and their keys (Corail Tombstone; decided 2026-10-22) -------------
@@ -747,6 +777,7 @@ global.SMS.config = {
         // its tb_enchanted data component (ModDataComponents.ENCHANTED, read from the
         // tombstone-9.5.6 jar); a plain key only opens the grave.
         enchantReturnedKeys: true,
+        enchantedComponent: 'tombstone:tb_enchanted',
     },
 
     // Blocks a player born into a realm with noContainers (animal, preta) may not open.
@@ -952,12 +983,29 @@ global.SMS.config = {
         preta: { anchor: 'worldSpawn' }, // only when it has no grave in the Overworld
         animal: { anchor: 'homeBiome' },
         deva: { anchor: 'biome', biomes: ['samsara:deva_plains', 'samsara:deva_meadow', 'samsara:deva_forest'] },
-        asura: { anchor: 'biome', biomes: ['samsara:deva_mountains', 'samsara:deva_snowy_peaks'] },
+        // edge: born where the search first meets the biome -- the FOOT of the mountains --
+        // rather than moved inside it as every other biome birth is (biomeSearch.inside).
+        asura: { anchor: 'biome', biomes: ['samsara:deva_mountains', 'samsara:deva_snowy_peaks'], edge: true },
     },
     // /locate biome's own numbers are 6400 / 32 / 64. 4096 blocks keeps the worst case
     // (a body whose biome is nowhere near) to ~100k climate samples, a fraction of a
     // second, once per kind per session.
-    biomeSearch: { radius: 4096, horizontalStep: 32, verticalStep: 64 },
+    //   excludeTags  biomes that never anchor a birth, whatever a list says: births are on
+    //                the surface, and the search samples underground too. c:is_underground
+    //                holds c:is_cave -- vanilla's lush and dripstone caves and the deep
+    //                dark (NeoForge) -- and Terralith's twelve cave/ biomes (2026-11-06: a
+    //                caiman anchored on cave/underground_jungle, from Alex's Mobs' list).
+    //   inside       how far around the biome's edge to look for ground INSIDE it, and on
+    //                what grid (samsara_rebirth.js insideBiome); `tries` caps the columns
+    //                read for ground. 48/8 is 169 biome samples and at most 2 x 12 ground
+    //                reads from the generator -- no chunk generated.
+    biomeSearch: {
+        radius: 4096,
+        horizontalStep: 32,
+        verticalStep: 64,
+        excludeTags: ['c:is_underground'],
+        inside: { radius: 48, step: 8, tries: 12 },
+    },
 
     // ---- Realm spawn points -------------------------------------------------
     // The fixed anchors, and every other realm's fallback. The `y` value is where the

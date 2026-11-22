@@ -149,6 +149,26 @@ function isClear(block) {
     return id === 'minecraft:air' || id === 'minecraft:cave_air' || id === 'minecraft:void_air'
 }
 
+// Soft cover a body can stand IN: a snow layer and the low plants on top of the ground.
+// Never a floor (NOT_GROUND), but feet and head may be in it, as vanilla lets a player
+// be. Found in game 2026-11-07: with only air allowed, snow-covered land had no stand at
+// all -- the snow layer was not clear, and above it the snow was not ground -- so every
+// open column of a snowy biome failed and a moose was born under a roof
+// (`no-sky-surface`, terralith:snowy_shield). Short grass and ferns did the same to
+// single columns. A full snow layer (8) blocks the sky light, so the sky passes skip it.
+const SOFT_COVER = [
+    'minecraft:snow',
+    'minecraft:short_grass',
+    'minecraft:tall_grass',
+    'minecraft:fern',
+    'minecraft:large_fern',
+    'minecraft:dead_bush',
+]
+
+function isPassable(block) {
+    return isClear(block) || SOFT_COVER.indexOf(idOf(block)) !== -1
+}
+
 // Is this block dangerous to stand on or in?
 function isDeadly(block) {
     var id = idOf(block)
@@ -231,8 +251,8 @@ function overVoid(level, x, y, z) {
 // `skyMode`: 'require' (surface realms), 'ignore' (cavern realms).
 function isValidStand(level, x, y, z, skyMode) {
     var feet = level.getBlock(x, y, z)
-    if (!isClear(feet)) return false
-    if (!isClear(level.getBlock(x, y + 1, z))) return false
+    if (!isPassable(feet)) return false
+    if (!isPassable(level.getBlock(x, y + 1, z))) return false
     if (!isGround(level.getBlock(x, y - 1, z))) return false
 
     if (skyMode === 'require') {
@@ -284,7 +304,14 @@ function scanColumn(level, x, z, yFrom, yTo, skyMode, budget) {
 //
 // `headroom` is how many clear blocks must sit above the head. 6 is enough to reject
 // every natural cave ceiling while still accepting a spot under an overhang or a
-// player's roof.
+// player's roof. Leaves and vines count as open (isCanopy): a canopy is not a cave
+// ceiling, and on 2026-11-06 a jungle's -- leaves 5 or 6 blocks up -- failed this pass at
+// the anchor, so the search jumped 64 blocks away (pass 4), generating more chunks.
+function isCanopy(block) {
+    var id = idOf(block)
+    return id.endsWith('_leaves') || id === 'minecraft:vine'
+}
+
 function scanColumnSurface(level, x, z, yTop, yBottom, headroom, budget) {
     if (typeof budget.spent !== 'number') budget.spent = 0
     var y = yTop
@@ -299,7 +326,8 @@ function scanColumnSurface(level, x, z, yTop, yBottom, headroom, budget) {
                 if (budget.reads <= 0) return null
                 budget.reads -= 1
                 budget.spent += 1
-                if (!isClear(level.getBlock(x, y + h, z))) {
+                var over = level.getBlock(x, y + h, z)
+                if (!isClear(over) && !isCanopy(over)) {
                     open = false
                     break
                 }
@@ -353,8 +381,10 @@ function spiralSearch(level, bx, bz, radius, yFrom, yTo, skyMode, budget) {
 // behaviour with an explicit, intentional cache of a spot we VERIFIED is good.
 //
 // Cleared on /reload (the script re-evaluates) and re-validated before every use, so
-// a cached spot that has since been griefed or changed is discarded.
-global.SMS.spawnCache = global.SMS.spawnCache || {}
+// a cached spot that has since been griefed or changed is discarded. It said "cleared"
+// while `|| {}` kept it until 2026-11-07: a moose's roofed spot, found under the old
+// stand rules, would have outlived the /reload that fixed them.
+global.SMS.spawnCache = {}
 
 // The cache key carries the ANCHOR column, not just the realm: a birth at its grave
 // (graveAnchor) has a different anchor per player, and keyed by realm alone the next
@@ -559,7 +589,7 @@ function findRebirthSpot(level, realm, anchor, dimId) {
             var tag = origins[gi][0] === 0 && origins[gi][1] === 0
                 ? 'anchor-band'
                 : 'anchor-band@' + origins[gi][0] + ',' + origins[gi][1]
-            return { spot: spot, pass: tag }
+            return { spot: spot, pass: tag, sky: cavern ? 'ignore' : 'require' }
         }
     }
 
@@ -569,7 +599,7 @@ function findRebirthSpot(level, realm, anchor, dimId) {
     } else {
         spot = spiralSearch(level, anchor.x, anchor.z, radius, bounds.max, bounds.min, 'require', freshBudget())
     }
-    if (spot) return { spot: spot, pass: 'full-range' }
+    if (spot) return { spot: spot, pass: 'full-range', sky: cavern ? 'ignore' : 'require' }
 
     // --- Pass 3: drop the sky requirement, but still demand the SURFACE.
     // Reached when a surface realm's spawn column is genuinely roofed -- which happens
@@ -596,7 +626,7 @@ function findRebirthSpot(level, realm, anchor, dimId) {
         level, anchor.x, anchor.z, radius,
         bounds.max, surfaceFloor, headroom, freshBudget()
     )
-    if (spot) return { spot: spot, pass: 'no-sky-surface' }
+    if (spot) return { spot: spot, pass: 'no-sky-surface', sky: 'ignore' }
 
     // --- Pass 4: widen the search area.
     // The spiral only covers +/-6 blocks. If the whole neighbourhood is built over or
@@ -618,7 +648,7 @@ function findRebirthSpot(level, realm, anchor, dimId) {
             headroom,
             freshBudget()
         )
-        if (spot) return { spot: spot, pass: 'widened+' + off[0] + ',' + off[1] }
+        if (spot) return { spot: spot, pass: 'widened+' + off[0] + ',' + off[1], sky: 'ignore' }
     }
 
     // --- Pass 5: last resort -- anywhere at all, including below minSurfaceY.
@@ -634,7 +664,7 @@ function findRebirthSpot(level, realm, anchor, dimId) {
             level, anchor.x, anchor.z, radius,
             bounds.max, bounds.min, 'ignore', freshBudget()
         )
-        if (spot) return { spot: spot, pass: 'deep-last-resort' }
+        if (spot) return { spot: spot, pass: 'deep-last-resort', sky: 'ignore' }
     }
 
     return null
@@ -694,9 +724,6 @@ function loadAnchorClass(name) {
 }
 const HeightmapTypes = loadAnchorClass('net.minecraft.world.level.levelgen.Heightmap$Types')
 const BlockPosClass = loadAnchorClass('net.minecraft.core.BlockPos')
-const TagKeyClass = loadAnchorClass('net.minecraft.tags.TagKey')
-const RegistriesClass = loadAnchorClass('net.minecraft.core.registries.Registries')
-const AnchorResourceLocation = loadAnchorClass('net.minecraft.resources.ResourceLocation')
 
 // The world's own spawn: Level.getSharedSpawnPos(), where vanilla put the world's first
 // spawn -- on land (it searches for it). Read from the Overworld; null if unreadable.
@@ -729,24 +756,29 @@ function surfaceY(level, x, z) {
 }
 
 // One biome condition, as config strings write them: 'ns:id', '#ns:tag', '!' in front to
-// negate (the animal homes' format, samsara_animal_homes.js). Returns a test on a
-// Holder<Biome>: getRegisteredName() for an id, is(TagKey) for a tag.
+// negate (the animal homes' format, samsara_animal_homes.js). Returns a test on a biome's
+// registered name and its tags (global.SMS.tagsOf).
 function biomeCondition(spec) {
     var s = '' + spec
     var neg = s.charAt(0) === '!'
     if (neg) s = s.substring(1)
-    var tag = null
-    if (s.charAt(0) === '#') {
-        tag = TagKeyClass.create(RegistriesClass.BIOME, AnchorResourceLocation.parse(s.substring(1)))
-    }
-    var id = s
-    return holder => {
-        var hit = tag !== null ? holder.is(tag) === true : ('' + holder.getRegisteredName()) === id
+    var isTag = s.charAt(0) === '#'
+    var id = isTag ? s.substring(1) : s
+    return (name, tags) => {
+        var hit = isTag ? tags[id] === true : name === id
         return neg ? !hit : hit
     }
 }
 
-// A test over GROUPS: any group may match, every condition in it must hold.
+// A test over GROUPS on a Holder<Biome>: any group may match, every condition in it must
+// hold. The answer is kept per biome (insideBiome asks about a few biomes hundreds of
+// times; tagsOf is a stream walk).
+//
+// A biome in biomeSearch.excludeTags never matches, whatever the groups say: a birth is
+// on the SURFACE, and vanilla's search samples underground too (every verticalStep of
+// height). On 2026-11-06 a caiman -- whose Alex's Mobs homes list Terralith's
+// cave/underground_jungle -- was anchored on a cave 3,400 blocks out and born on whatever
+// surface lay above it.
 function biomeGroupsTest(groups) {
     var built = []
     for (var i = 0; i < groups.length; i++) {
@@ -754,18 +786,31 @@ function biomeGroupsTest(groups) {
         for (var j = 0; j < groups[i].length; j++) conds.push(biomeCondition(groups[i][j]))
         built.push(conds)
     }
+    var excluded = (global.SMS.config.biomeSearch || {}).excludeTags || []
+    var known = {}
     return holder => {
-        for (var g = 0; g < built.length; g++) {
+        var name = '' + holder.getRegisteredName()
+        if (known[name] !== undefined) return known[name]
+        var tags = global.SMS.tagsOf(holder)
+        for (var x = 0; x < excluded.length; x++) {
+            if (tags[excluded[x]] === true) {
+                known[name] = false
+                return false
+            }
+        }
+        var any = false
+        for (var g = 0; g < built.length && !any; g++) {
             var all = true
             for (var c = 0; c < built[g].length; c++) {
-                if (!built[g][c](holder)) {
+                if (!built[g][c](name, tags)) {
                     all = false
                     break
                 }
             }
-            if (all) return true
+            if (all) any = true
         }
-        return false
+        known[name] = any
+        return any
     }
 }
 
@@ -778,14 +823,29 @@ global.SMS.homeBiomeTest = form => {
     return biomeGroupsTest(groups)
 }
 
+// Where a body is born FIRST (config.animalBirth.preferredHomes), as a biome test; null
+// for a body with none.
+global.SMS.preferredHomeTest = form => {
+    var pref = (global.SMS.config.animalBirth || {}).preferredHomes || {}
+    var groups = pref['' + form]
+    if (!groups || groups.length === 0) return null
+    return biomeGroupsTest(groups)
+}
+
 // The nearest biome passing `test` to `from`, by vanilla's /locate biome search
 // (ServerLevel.findClosestBiome3d: the biome source sampled outward in a spiral, so the
-// first hit is the nearest -- for a large biome, its edge). {x, z, biome} or null.
+// first hit is the nearest -- for a large biome, its edge). {x, y, z, biome} or null; y
+// is the height the biome was sampled at. (Read from the jar: the predicate filters the
+// source's possible biomes ONCE, then each column is sampled at every verticalStep of
+// height from `from.y` -- which is why a cave biome could match, see biomeGroupsTest.)
 //
 // Cached by `key` -- which names the dimension -- and origin: biomes are fixed by the
-// seed, so only the first birth of a kind pays. Cleared when a world loads (ServerEvents.loaded, below): a new world in the
-// same session has a new seed.
-global.SMS.biomeAnchorCache = global.SMS.biomeAnchorCache || {}
+// seed, so only the first birth of a kind pays. Cleared when a world loads
+// (ServerEvents.loaded, below: a new world in the same session has a new seed) and at
+// every /reload (here: a datapack can change the biome tags). A search that THREW is not
+// cached: in game 2026-11-06 a failed tag check was kept as "no such biome", and only a
+// restart would have let it search again.
+global.SMS.biomeAnchorCache = {}
 function nearestBiome(level, test, key, from) {
     var ck = '' + key + '@' + from.x + ',' + from.z
     var cache = global.SMS.biomeAnchorCache
@@ -799,12 +859,14 @@ function nearestBiome(level, test, key, from) {
             var bp = pair.getFirst()
             found = {
                 x: Math.floor(Number(bp.getX())),
+                y: Math.floor(Number(bp.getY())),
                 z: Math.floor(Number(bp.getZ())),
                 biome: '' + pair.getSecond().getRegisteredName(),
             }
         }
     } catch (e) {
         console.warn(`[Samsara] biome search '${key}' failed: ${e}`)
+        return null
     }
     cache[ck] = found
     return found
@@ -814,17 +876,103 @@ ServerEvents.loaded(event => {
     global.SMS.biomeAnchorCache = {}
 })
 
+// The anchor moved INTO its biome. The search gives the biome's EDGE -- the first sample
+// of it on the way out -- so half the ground around it is another biome; on 2026-11-06 a
+// crocodile anchored in mid-river and a komodo dragon in a jungle each found no stand
+// within 6 blocks and were born 64 blocks off (pass 4), likely outside their biome, and
+// each such jump generated more chunks on the server thread.
+//
+// So: a grid around the edge (biomeSearch.inside: radius, step), read from the terrain
+// GENERATOR alone -- the biome from ServerLevel.getUncachedNoiseBiome (quart coordinates;
+// the biome source itself, no chunk touched -- read from the jar), the ground from
+// ChunkGenerator.getBaseHeight -- and the point deepest inside the biome (most of its
+// eight grid neighbours in it, then nearest the edge) whose column is LAND: no water over
+// the floor (WORLD_SURFACE_WG = OCEAN_FLOOR_WG) and still the biome at its surface. A
+// biome with no land in reach (a river) gives its nearest bank instead: land beside it.
+// {x, z, y, bank} or null (keep the edge). At most `tries` columns are read for ground
+// each way. Cached with the search; a throw is not.
+function insideBiome(level, test, key, edge) {
+    var ins = (global.SMS.config.biomeSearch || {}).inside
+    if (!ins) return null
+    var ck = '' + key + '@' + edge.x + ',' + edge.z + '|inside'
+    var cache = global.SMS.biomeAnchorCache
+    if (cache[ck] !== undefined) return cache[ck]
+    var tools = terrainProbeTools(level)
+    if (!tools) return null
+    var r = Math.floor(ins.radius / ins.step)
+    var n = 2 * r + 1
+    var cells = []
+    var found = null
+    try {
+        var qy = Math.floor(edge.y) >> 2
+        for (var i = 0; i < n; i++) {
+            for (var j = 0; j < n; j++) {
+                var cx = edge.x + (i - r) * ins.step
+                var cz = edge.z + (j - r) * ins.step
+                cells.push({ x: cx, z: cz, i: i, j: j, home: test(level.getUncachedNoiseBiome(cx >> 2, qy, cz >> 2)) === true })
+            }
+        }
+        var at = (i2, j2) => (i2 < 0 || j2 < 0 || i2 >= n || j2 >= n ? null : cells[i2 * n + j2])
+        var inside = []
+        var banks = []
+        for (var c = 0; c < cells.length; c++) {
+            var cell = cells[c]
+            var near = 0
+            var touches = false
+            for (var di = -1; di <= 1; di++) {
+                for (var dj = -1; dj <= 1; dj++) {
+                    if (di === 0 && dj === 0) continue
+                    var nb = at(cell.i + di, cell.j + dj)
+                    if (nb && nb.home) {
+                        near++
+                        touches = true
+                    }
+                }
+            }
+            cell.depth = near
+            cell.dist = Math.abs(cell.x - edge.x) + Math.abs(cell.z - edge.z)
+            if (cell.home) inside.push(cell)
+            else if (touches) banks.push(cell)
+        }
+        inside.sort((p, q) => q.depth - p.depth || p.dist - q.dist)
+        banks.sort((p, q) => p.dist - q.dist)
+        // Land, and (inside) still the biome where the ground actually is.
+        var land = (cell2, mustBeHome) => {
+            var top = baseHeight(level, tools, cell2.x, cell2.z)
+            var floor = baseHeight(level, tools, cell2.x, cell2.z, HeightmapTypes.OCEAN_FLOOR_WG)
+            if (top === null || floor === null || top !== floor) return null
+            if (mustBeHome && test(level.getUncachedNoiseBiome(cell2.x >> 2, Math.floor(top) >> 2, cell2.z >> 2)) !== true) return null
+            return Math.floor(top)
+        }
+        for (var a = 0; a < inside.length && a < ins.tries && !found; a++) {
+            var ya = land(inside[a], true)
+            if (ya !== null) found = { x: inside[a].x, z: inside[a].z, y: ya, bank: false }
+        }
+        for (var b = 0; b < banks.length && b < ins.tries && !found; b++) {
+            var yb = land(banks[b], false)
+            if (yb !== null) found = { x: banks[b].x, z: banks[b].z, y: yb, bank: true }
+        }
+    } catch (e) {
+        console.warn(`[Samsara] could not look inside the biome for '${key}'; the birth starts at its edge: ${e}`)
+        return null
+    }
+    cache[ck] = found
+    return found
+}
+
 // Where a birth into `realm` is anchored (config.birthPlace; decided 2026-10-25, the
 // user): {x, y, z, how}. `level` is the realm's dimension; `form` is an animal birth's
 // body. Rebirth means losing your place in the world, so it is never where the player
 // died. The cases, first match:
 //   a preta's grave (graveAnchor) -- the last HUMAN death, a different life's place;
 //   'worldSpawn'  the world's own spawn;
-//   'homeBiome'   the nearest of the body's home biomes to the world's spawn;
+//   'homeBiome'   the nearest of the body's PREFERRED homes (animalBirth.preferredHomes)
+//                 to the world's spawn, else the nearest of all its homes;
 //   'biome'       the nearest of birthPlace.biomes to realmSpawns[realm];
 //   otherwise, or when a search finds nothing, the world's spawn for a 'worldSpawn' /
 //   'homeBiome' realm and realmSpawns[realm] for the rest.
-// A birth found by biome starts at that column's surface (heightmap).
+// A birth found by biome is moved inside it (biomeAnchor) and starts at that column's
+// surface (heightmap).
 global.SMS.birthAnchor = (player, realm, level, form) => {
     const cfg = global.SMS.config
     try {
@@ -840,16 +988,24 @@ global.SMS.birthAnchor = (player, realm, level, form) => {
     if (place.anchor === 'worldSpawn' || place.anchor === 'homeBiome') {
         var ws = global.SMS.worldSpawn(player.server)
         if (place.anchor === 'homeBiome' && ws) {
-            var test = global.SMS.homeBiomeTest(form)
-            var hit = test ? nearestBiome(level, test, dimId + '|home:' + form, ws) : null
-            if (hit) a = { x: hit.x, y: ws.y, z: hit.z, how: 'home-biome ' + hit.biome }
+            var searches = [
+                { test: global.SMS.preferredHomeTest(form), key: dimId + '|prefer:' + form },
+                { test: global.SMS.homeBiomeTest(form), key: dimId + '|home:' + form },
+            ]
+            for (var t = 0; t < searches.length && !a; t++) {
+                if (!searches[t].test) continue
+                var hit = nearestBiome(level, searches[t].test, searches[t].key, ws)
+                if (hit) a = biomeAnchor(level, place, searches[t].test, searches[t].key, hit, ws.y, 'home-biome ')
+            }
         }
         if (!a && ws) a = { x: ws.x, y: ws.y, z: ws.z, how: 'world-spawn' }
     } else if (place.anchor === 'biome' && place.biomes && place.biomes.length > 0) {
         var groups = []
         for (var i = 0; i < place.biomes.length; i++) groups.push([place.biomes[i]])
-        var hit2 = nearestBiome(level, biomeGroupsTest(groups), dimId + '|biomes:' + place.biomes.join(','), c)
-        if (hit2) a = { x: hit2.x, y: c.y, z: hit2.z, how: 'biome ' + hit2.biome }
+        var btest = biomeGroupsTest(groups)
+        var bkey = dimId + '|biomes:' + place.biomes.join(',')
+        var hit2 = nearestBiome(level, btest, bkey, c)
+        if (hit2) a = biomeAnchor(level, place, btest, bkey, hit2, c.y, 'biome ')
     }
     if (!a) return { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z), how: 'realm-spawn' }
     if (a.how !== 'world-spawn') {
@@ -857,6 +1013,15 @@ global.SMS.birthAnchor = (player, realm, level, form) => {
         if (sy !== null) a.y = sy
     }
     return a
+}
+
+// The anchor for a biome the search found: moved inside it (insideBiome), unless the
+// realm is born at the biome's edge (birthPlace.<realm>.edge -- the asura, at the FOOT of
+// the mountains). A bank, where the biome had no land in reach, says so in the line.
+function biomeAnchor(level, place, test, key, hit, y, label) {
+    var inner = place.edge ? null : insideBiome(level, test, key, hit)
+    if (!inner) return { x: hit.x, y: y, z: hit.z, how: label + hit.biome }
+    return { x: inner.x, y: y, z: inner.z, how: label + hit.biome + (inner.bank ? ' (its bank)' : '') }
 }
 
 // ---- A human's home: the bed or respawn anchor it set (birthPlace.human.home) ----
@@ -1044,9 +1209,13 @@ global.SMS.pickDestination = player => {
         // server_scripts files is not guaranteed; an undefined clock must not make
         // this NaN (every comparison against NaN is false, which silently disables
         // the cache -- the same class of bug as the long-reads-as-NaN trap).
+        // Re-checked by the sky rule of the pass that FOUND it (cached.sky): a spot from a
+        // pass that lets the sky go (no-sky-surface, widened, under a jungle canopy) never
+        // passed a sky-required check, so on 2026-11-06 a komodo dragon's spot was searched
+        // afresh at every birth -- and every human spot of the 10-25 world as well.
         var fresh = (global.SMS.tickClock || 0) - cached.at
         if (fresh >= 0 && fresh < cfg.safeSpawn.cacheTicks) {
-            if (isValidStand(level, cached.x, cached.y, cached.z, skyMode)) {
+            if (isValidStand(level, cached.x, cached.y, cached.z, cached.sky || skyMode)) {
                 return destination({ x: cached.x, y: cached.y, z: cached.z }, { cached: true })
             }
         }
@@ -1087,6 +1256,7 @@ global.SMS.pickDestination = player => {
         x: found.spot.x,
         y: found.spot.y,
         z: found.spot.z,
+        sky: found.sky || skyMode,
         at: global.SMS.tickClock || 0,
     }
 
@@ -1108,9 +1278,12 @@ function terrainProbeTools(level) {
         return null
     }
 }
-function baseHeight(level, tools, x, z) {
+// The generator's ground at x,z: WORLD_SURFACE_WG (the first non-air block, water
+// included) unless `type` says otherwise -- OCEAN_FLOOR_WG is the first that blocks
+// motion, so the two differ exactly where water lies over the floor.
+function baseHeight(level, tools, x, z, type) {
     try {
-        var h = Number(tools.gen.getBaseHeight(x, z, HeightmapTypes.WORLD_SURFACE_WG, level, tools.rs))
+        var h = Number(tools.gen.getBaseHeight(x, z, type || HeightmapTypes.WORLD_SURFACE_WG, level, tools.rs))
         return isFinite(h) ? h : null
     } catch (e) {
         return null
@@ -1145,7 +1318,7 @@ function probeForLand(level, realm, anchor, dimId) {
                 if (h <= bounds.min + 1) continue
                 loadChunkAt(level, x, z)
                 var r = findRebirthSpot(level, realm, { x: x, y: Math.floor(h), z: z }, dimId)
-                if (r) return { spot: r.spot, pass: 'probe@' + dx * pr.step + ',' + dz * pr.step + '/' + r.pass }
+                if (r) return { spot: r.spot, pass: 'probe@' + dx * pr.step + ',' + dz * pr.step + '/' + r.pass, sky: r.sky }
                 tries++
                 if (tries >= pr.tries) return null
             }

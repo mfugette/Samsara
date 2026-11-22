@@ -1666,9 +1666,16 @@ function predatorOf(source, off) {
     } catch (ignored) {
         return null
     }
-    var type = '' + actual.type
-    if ((off.predators || []).indexOf(type) !== -1) return actual
-    return diets.indexOf('' + global.SMS.animalDietOf(type)) !== -1 ? actual : null
+    return global.SMS.isPredatorType('' + actual.type) ? actual : null
+}
+
+// A mob type that hunts: listed in offering.predators, or a creature of one of
+// offering.predatorDiets' tiers. The predators of the offering, and the only mobs that
+// may still hunt an animal-born player (samsara_realms.js, huntedOnlyByPredators).
+global.SMS.isPredatorType = type => {
+    const off = (global.SMS.config.animalBirth || {}).offering || {}
+    if ((off.predators || []).indexOf('' + type) !== -1) return true
+    return (off.predatorDiets || []).indexOf('' + global.SMS.animalDietOf(type)) !== -1
 }
 
 global.SMS.offering = {
